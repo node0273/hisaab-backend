@@ -1,14 +1,29 @@
 """
 Gmail reader — fetches and parses bank transaction emails
-Uses rule-based parsing first, AI fallback for unknowns
+Auto-refreshes expired access tokens
 """
 import base64
 import re
 import requests
+import os
 from datetime import datetime, timedelta
-from db import queue_unknown_email
+from db import queue_unknown_email, save_user_tokens
 
 GMAIL_API = "https://gmail.googleapis.com/gmail/v1/users/me"
+
+def refresh_token(refresh_tok: str) -> str:
+    """Get a new access token using the refresh token."""
+    resp = requests.post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "refresh_token": refresh_tok,
+            "client_id": os.environ.get("GOOGLE_CLIENT_ID"),
+            "client_secret": os.environ.get("GOOGLE_CLIENT_SECRET"),
+            "grant_type": "refresh_token",
+        }
+    )
+    resp.raise_for_status()
+    return resp.json()["access_token"]
 
 def gmail_get(path, access_token, params=None):
     resp = requests.get(
@@ -130,9 +145,8 @@ def parse_hsbc(msg):
     return {"bank": "HSBC", "mode": mode, "merchant": merchant, "amount": amount,
             "date": datetime.now().strftime("%d-%m-%Y")}
 
-def get_transactions(access_token: str, refresh_token: str, days: int = 30) -> list:
+def get_transactions(access_token: str, refresh_token_str: str, days: int = 30, user_id: str = None) -> list:
     after = (datetime.now() - timedelta(days=days)).strftime("%Y/%m/%d")
-    before = datetime.now().strftime("%Y/%m/%d")
 
     queries = [
         f"from:alerts@hdfcbank.net after:{after}",
@@ -142,23 +156,49 @@ def get_transactions(access_token: str, refresh_token: str, days: int = 30) -> l
     ]
 
     transactions = []
-    for query in queries:
-        try:
-            data = gmail_get("messages", access_token, {"q": query, "maxResults": 100})
-            for m in data.get("messages", []):
-                full = gmail_get(f"messages/{m['id']}", access_token)
-                sender = get_header(full, "From")
 
-                if "hdfc" in sender.lower():
-                    parsed = parse_hdfc(full)
-                elif "hsbc" in sender.lower() or "mandatehq" in sender.lower():
-                    parsed = parse_hsbc(full)
-                else:
-                    parsed = None
+    # Try with current token, refresh if expired
+    def try_gmail(token):
+        results = []
+        for query in queries:
+            try:
+                data = gmail_get("messages", token, {"q": query, "maxResults": 100})
+                for m in data.get("messages", []):
+                    full = gmail_get(f"messages/{m['id']}", token)
+                    sender = get_header(full, "From")
+                    if "hdfc" in sender.lower():
+                        parsed = parse_hdfc(full)
+                    elif "hsbc" in sender.lower() or "mandatehq" in sender.lower():
+                        parsed = parse_hsbc(full)
+                    else:
+                        parsed = None
+                    if parsed:
+                        results.append(parsed)
+            except Exception:
+                continue
+        return results
 
-                if parsed:
-                    transactions.append(parsed)
-        except Exception:
-            continue
+    try:
+        transactions = try_gmail(access_token)
+    except Exception as e:
+        if "401" in str(e) or "403" in str(e):
+            # Token expired — refresh it
+            try:
+                new_token = refresh_token(refresh_token_str)
+                # Save new token to DB if user_id provided
+                if user_id:
+                    from db import get_conn, encrypt
+                    with get_conn() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "UPDATE users SET access_token_enc = %s WHERE whatsapp_number = %s",
+                                (encrypt(new_token), user_id)
+                            )
+                            conn.commit()
+                transactions = try_gmail(new_token)
+            except Exception as refresh_err:
+                raise Exception(f"Token refresh failed: {refresh_err}")
+        else:
+            raise e
 
     return transactions

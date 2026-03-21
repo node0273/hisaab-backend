@@ -80,7 +80,8 @@ What would you like to know?"""
         transactions = get_transactions(
             access_token=user["access_token"],
             refresh_token=user["refresh_token"],
-            days=30
+            days=30,
+            user_id=user_id
         )
         reply = await generate_reply(transactions, history, message)
     except Exception as e:
@@ -98,7 +99,8 @@ async def generate_summary(user: dict) -> str:
         transactions = get_transactions(
             access_token=user["access_token"],
             refresh_token=user["refresh_token"],
-            days=30
+            days=30,
+            user_id=user_id
         )
         if not transactions:
             return """I couldn't find any bank transactions in the last 30 days\.
