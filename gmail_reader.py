@@ -1,24 +1,25 @@
 """
 Gmail reader — fetches and parses bank transaction emails
-Auto-refreshes expired access tokens
+Auto-refreshes expired tokens
 """
 import base64
 import re
 import requests
-import os
 from datetime import datetime, timedelta
 from db import queue_unknown_email, save_user_tokens
 
 GMAIL_API = "https://gmail.googleapis.com/gmail/v1/users/me"
+GOOGLE_CLIENT_ID = __import__('os').environ.get("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = __import__('os').environ.get("GOOGLE_CLIENT_SECRET")
 
-def refresh_token(refresh_tok: str) -> str:
-    """Get a new access token using the refresh token."""
+def refresh_token_func(refresh_token: str) -> str:
+    """Refresh expired access token."""
     resp = requests.post(
         "https://oauth2.googleapis.com/token",
         data={
-            "refresh_token": refresh_tok,
-            "client_id": os.environ.get("GOOGLE_CLIENT_ID"),
-            "client_secret": os.environ.get("GOOGLE_CLIENT_SECRET"),
+            "refresh_token": refresh_token,
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
             "grant_type": "refresh_token",
         }
     )
@@ -155,16 +156,43 @@ def get_transactions(access_token: str, refresh_token: str, days: int = 30, user
         f"from:hsbc@mandatehq.com after:{after}",
     ]
 
+    # Try with current token, refresh if expired
+    def try_gmail_get(path, token, params=None):
+        try:
+            return gmail_get(path, token, params), token
+        except requests.HTTPError as e:
+            if e.response.status_code in [401, 403] and refresh_token:
+                new_token = refresh_token_func(refresh_token)
+                # Save new token to DB if user_id provided
+                if user_id:
+                    try:
+                        from db import get_conn
+                        import os
+                        from cryptography.fernet import Fernet
+                        import base64
+                        key = os.environ.get("ENCRYPTION_KEY", "").encode()
+                        key_bytes = base64.urlsafe_b64encode(key[:32].ljust(32, b'0'))
+                        cipher = Fernet(key_bytes)
+                        enc = cipher.encrypt(new_token.encode()).decode()
+                        with get_conn() as conn:
+                            with conn.cursor() as cur:
+                                cur.execute("UPDATE users SET access_token_enc = %s WHERE whatsapp_number = %s",
+                                          (enc, user_id))
+                                conn.commit()
+                    except:
+                        pass
+                return gmail_get(path, new_token, params), new_token
+            raise
+
+    current_token = access_token
     transactions = []
 
-    # Try with current token, refresh if expired
-    def try_gmail(token):
-        results = []
-        for query in queries:
-            try:
-                data = gmail_get("messages", token, {"q": query, "maxResults": 100})
-                for m in data.get("messages", []):
-                    full = gmail_get(f"messages/{m['id']}", token)
+    for query in queries:
+        try:
+            data, current_token = try_gmail_get("messages", current_token, {"q": query, "maxResults": 100})
+            for m in data.get("messages", []):
+                try:
+                    full, current_token = try_gmail_get(f"messages/{m['id']}", current_token)
                     sender = get_header(full, "From")
                     if "hdfc" in sender.lower():
                         parsed = parse_hdfc(full)
@@ -173,32 +201,10 @@ def get_transactions(access_token: str, refresh_token: str, days: int = 30, user
                     else:
                         parsed = None
                     if parsed:
-                        results.append(parsed)
-            except Exception:
-                continue
-        return results
-
-    try:
-        transactions = try_gmail(access_token)
-    except Exception as e:
-        if "401" in str(e) or "403" in str(e):
-            # Token expired — refresh it
-            try:
-                new_token = refresh_token(refresh_token)
-                # Save new token to DB if user_id provided
-                if user_id:
-                    from db import get_conn, encrypt
-                    with get_conn() as conn:
-                        with conn.cursor() as cur:
-                            cur.execute(
-                                "UPDATE users SET access_token_enc = %s WHERE whatsapp_number = %s",
-                                (encrypt(new_token), user_id)
-                            )
-                            conn.commit()
-                transactions = try_gmail(new_token)
-            except Exception as refresh_err:
-                raise Exception(f"Token refresh failed: {refresh_err}")
-        else:
-            raise e
+                        transactions.append(parsed)
+                except:
+                    continue
+        except Exception:
+            continue
 
     return transactions
