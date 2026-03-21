@@ -1,6 +1,3 @@
-"""
-Twilio WhatsApp sender
-"""
 import os
 from twilio.rest import Client
 
@@ -10,6 +7,9 @@ FROM_NUMBER = os.environ.get("TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886")
 
 def send_whatsapp(to_number: str, message: str):
     client = Client(ACCOUNT_SID, AUTH_TOKEN)
+    # Ensure number has + prefix
+    if not to_number.startswith("+"):
+        to_number = "+" + to_number
     if not to_number.startswith("whatsapp:"):
         to_number = f"whatsapp:{to_number}"
     client.messages.create(
