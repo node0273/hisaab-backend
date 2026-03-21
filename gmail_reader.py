@@ -145,7 +145,7 @@ def parse_hsbc(msg):
     return {"bank": "HSBC", "mode": mode, "merchant": merchant, "amount": amount,
             "date": datetime.now().strftime("%d-%m-%Y")}
 
-def get_transactions(access_token: str, refresh_token_str: str, days: int = 30, user_id: str = None) -> list:
+def get_transactions(access_token: str, refresh_token: str, days: int = 30, user_id: str = None) -> list:
     after = (datetime.now() - timedelta(days=days)).strftime("%Y/%m/%d")
 
     queries = [
@@ -184,7 +184,7 @@ def get_transactions(access_token: str, refresh_token_str: str, days: int = 30, 
         if "401" in str(e) or "403" in str(e):
             # Token expired — refresh it
             try:
-                new_token = refresh_token(refresh_token_str)
+                new_token = refresh_token(refresh_token)
                 # Save new token to DB if user_id provided
                 if user_id:
                     from db import get_conn, encrypt
