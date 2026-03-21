@@ -1,10 +1,8 @@
-"""
-Hisaab — WhatsApp expense intelligence bot
-Main FastAPI backend
-"""
 from fastapi import FastAPI, Request, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse, HTMLResponse
+from fastapi.responses import PlainTextResponse, HTMLResponse, RedirectResponse
+from pydantic import BaseModel
+from typing import List, Dict, Any
 import os
 from bot import handle_message
 from auth_link import get_google_auth_url, handle_google_callback
@@ -39,8 +37,9 @@ async def whatsapp_webhook(
 
 @app.get("/auth/google")
 def google_auth(number: str):
+    """Redirects user directly to Google OAuth — no JSON, no file download."""
     url = get_google_auth_url(number)
-    return {"url": url}
+    return RedirectResponse(url=url)
 
 @app.get("/auth/callback")
 async def google_callback(code: str, state: str):
