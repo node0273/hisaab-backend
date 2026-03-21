@@ -143,4 +143,4 @@ Which bank do you use? I'll help check\."""
 Ask me anything — "food spend?", "big transactions?", "compare this week vs last" """
 
     except Exception as e:
-        return f"Couldn't fetch your summary right now\. Please try again\."
+        return f"Error: {str(e)}"
