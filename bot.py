@@ -38,21 +38,39 @@ async def handle_message(user_id: str, message: str) -> str:
         if message_lower == "i agree":
             save_consent(user_id)
             auth_url = f"{BACKEND_URL}/auth/google?number={user_id}"
-            return f"✅ Thank you\!\n\nNow connect your Gmail so I can read your bank alerts\.\n\n👉 [Tap here to connect Gmail]({auth_url})\n\nCome back here once done\!"
+            return f"""✅ Thank you\!
+
+Now connect your Gmail so I can read your bank alerts\.
+
+👉 [Tap here to connect Gmail]({auth_url})
+
+Come back here once done\!"""
         else:
             return CONSENT_MESSAGE
 
     if not user.get("onboarded"):
         auth_url = f"{BACKEND_URL}/auth/google?number={user_id}"
-        return f"You haven't connected your Gmail yet\.\n\n👉 [Tap here to connect Gmail]({auth_url})"
+        return f"""You haven't connected your Gmail yet\.
+
+👉 [Tap here to connect Gmail]({auth_url})"""
 
     if message_lower in ["hi", "hello", "hey", "/start", "start"]:
         name = user.get("name", "").split()[0] if user.get("name") else "there"
-        return f"Hi {name}\! 👋 I'm Hisaab, your expense assistant\.\n\nHere's what you can ask:\n• *summary* — 30\-day spending overview\n• How much did I spend on food?\n• What are my subscriptions?\n• Any unusual transactions?\n• Which merchant did I spend most on?\n\nWhat would you like to know?"
+        return f"""Hi {name}\! 👋 I'm Hisaab, your expense assistant\.
+
+Here's what you can ask:
+• *summary* — 30\-day spending overview
+• How much did I spend on food?
+• What are my subscriptions?
+• Any unusual transactions?
+• Which merchant did I spend most on?
+
+What would you like to know?"""
 
     if message_lower in ["summary", "/summary"]:
-        return await generate_summary(user)
+        return await generate_summary(user, user_id)
 
+    # AI chat for everything else
     save_message(user_id, "user", message)
     history = get_recent_messages(user_id, limit=8)
 
@@ -60,28 +78,33 @@ async def handle_message(user_id: str, message: str) -> str:
         transactions = get_transactions(
             access_token=user["access_token"],
             refresh_token=user["refresh_token"],
-            days=30
+            days=30,
+            user_id=user_id
         )
         reply = await generate_reply(transactions, history, message)
     except Exception as e:
-        if "401" in str(e) or "403" in str(e):
-            auth_url = f"{BACKEND_URL}/auth/google?number={user_id}"
-            reply = f"Your Gmail access expired\. Please reconnect:\n{auth_url}"
-        else:
-            reply = f"Error: {str(e)}"
+        reply = f"Error: {str(e)[:200]}"
 
     save_message(user_id, "assistant", reply)
     return reply
 
-async def generate_summary(user: dict) -> str:
+async def generate_summary(user: dict, user_id: str) -> str:
     try:
         transactions = get_transactions(
             access_token=user["access_token"],
             refresh_token=user["refresh_token"],
-            days=30
+            days=30,
+            user_id=user_id
         )
         if not transactions:
-            return "I couldn't find any bank transactions in the last 30 days\.\n\nPossible reasons:\n• Your bank alert emails are in a different Gmail account\n• Your bank doesn't send email alerts \(enable them in net banking\)\n• Emails might be in spam\n\nWhich bank do you use? I'll help check\."
+            return """I couldn't find any bank transactions in the last 30 days\.
+
+Possible reasons:
+• Your bank alert emails are in a different Gmail account
+• Emails might be in spam — check and move them to inbox
+• Your bank might not send email alerts \(enable in net banking\)
+
+Which bank do you use? I'll help check\."""
 
         total = sum(t["amount"] for t in transactions)
         count = len(transactions)
@@ -100,7 +123,18 @@ async def generate_summary(user: dict) -> str:
             mode_totals[mode] = mode_totals.get(mode, 0) + t.get("amount", 0)
         mode_lines = "\n".join([f"  • {m}: ₹{round(amt):,}" for m, amt in sorted(mode_totals.items(), key=lambda x: x[1], reverse=True)])
 
-        return f"📊 *Your 30\-day Summary*\n\n💰 Total spent: *₹{round(total):,}*\n📝 Transactions: {count}\n\n🏪 *Top merchants:*\n{top_lines}\n\n💳 *By payment mode:*\n{mode_lines}\n\nAsk me anything — food spend?, big transactions?, compare weeks"
+        return f"""📊 *Your 30\-day Summary*
+
+💰 Total spent: *₹{round(total):,}*
+📝 Transactions: {count}
+
+🏪 *Top merchants:*
+{top_lines}
+
+💳 *By payment mode:*
+{mode_lines}
+
+Ask me anything — "food spend?", "big transactions?", "compare this week vs last" """
 
     except Exception as e:
-        return f"Error fetching summary: {str(e)}"
+        return f"Error fetching summary: {str(e)[:200]}"
