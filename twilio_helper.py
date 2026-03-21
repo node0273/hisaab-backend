@@ -7,11 +7,13 @@ FROM_NUMBER = os.environ.get("TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886")
 
 def send_whatsapp(to_number: str, message: str):
     client = Client(ACCOUNT_SID, AUTH_TOKEN)
-    # Ensure number has + prefix
+    # Clean the number — remove whatsapp: prefix if present
+    to_number = to_number.replace("whatsapp:", "").strip()
+    # Add + only if not already there
     if not to_number.startswith("+"):
         to_number = "+" + to_number
-    if not to_number.startswith("whatsapp:"):
-        to_number = f"whatsapp:{to_number}"
+    # Add whatsapp: prefix
+    to_number = f"whatsapp:{to_number}"
     client.messages.create(
         body=message,
         from_=FROM_NUMBER,
