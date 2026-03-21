@@ -1,89 +1,80 @@
 """
-Hisaab bot — core conversation handler
-Manages user state and routes messages
+Hisaab bot — core conversation handler (Telegram)
 """
 import os
-from db import (get_user, create_user, save_consent, save_message,
-                get_recent_messages, delete_user)
-from auth_link import get_google_auth_url
+import httpx
+from db import get_user, create_user, save_consent, save_message, get_recent_messages, delete_user
 from gmail_reader import get_transactions
 from ai_brain import generate_reply
 
-BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:8000")
+BACKEND_URL = os.environ.get("BACKEND_URL", "")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
-CONSENT_MESSAGE = """Welcome to *Hisaab* — your personal finance assistant.
+CONSENT_MESSAGE = """👋 Welcome to *Hisaab* — your personal finance assistant.
 
 Before we begin, here's what I do:
-• Read your bank alert emails (HDFC, HSBC, and more)
+• Read your bank alert emails (HDFC, HSBC & more)
 • Analyse where your money goes
-• Answer your questions about your spending
+• Answer your spending questions in plain language
 
-*Your privacy matters:*
-• Your data is stored securely in India
-• I never read personal emails — only bank alerts
-• You can delete your data anytime by typing *DELETE MY DATA*
-• Read-only access to Gmail
+*Your privacy:*
+• Data stored securely in India 🇮🇳
+• Read-only Gmail access — no personal emails read
+• Type *DELETE MY DATA* anytime to remove everything
 
 Type *I AGREE* to continue."""
 
-async def handle_message(whatsapp_number: str, message: str) -> str:
+async def handle_message(user_id: str, message: str) -> str:
     message_lower = message.lower().strip()
 
-    # Delete data request
-    if message_lower in ["delete my data", "delete data", "deletedata"]:
-        delete_user(whatsapp_number)
-        return "Your data has been deleted. Type anything to start fresh."
+    if message_lower in ["delete my data", "delete data"]:
+        delete_user(user_id)
+        return "✅ Your data has been deleted. Send anything to start fresh."
 
-    # Get or create user
-    user = get_user(whatsapp_number)
+    user = get_user(user_id)
     if not user:
-        create_user(whatsapp_number)
+        create_user(user_id)
         return CONSENT_MESSAGE
 
-    # Consent flow
     if not user.get("consent_given"):
         if message_lower == "i agree":
-            save_consent(whatsapp_number)
-            backend_url = BACKEND_URL
-            auth_url = f"{backend_url}/auth/google?number={whatsapp_number}"
-            return f"""Thank you! Now connect your Gmail so I can read your bank alerts.
+            save_consent(user_id)
+            auth_url = f"{BACKEND_URL}/auth/google?number={user_id}"
+            return f"""✅ Thank you\!
 
-Tap the link below to sign in with Google:
-{auth_url}
+Now connect your Gmail so I can read your bank alerts\.
 
-This takes 30 seconds. Come back here once done."""
+👉 [Tap here to connect Gmail]({auth_url})
+
+Come back here once done\!"""
         else:
             return CONSENT_MESSAGE
 
-    # Not yet onboarded (Gmail not connected)
     if not user.get("onboarded"):
-        auth_url = f"{BACKEND_URL}/auth/google?number={whatsapp_number}"
-        return f"""You haven't connected your Gmail yet.
+        auth_url = f"{BACKEND_URL}/auth/google?number={user_id}"
+        return f"""You haven't connected your Gmail yet\.
 
-Tap this link to connect:
-{auth_url}"""
+👉 [Tap here to connect Gmail]({auth_url})"""
 
-    # Fully onboarded — handle commands
-    if message_lower in ["hi", "hello", "hey", "hii", "helo"]:
+    if message_lower in ["hi", "hello", "hey", "/start", "start"]:
         name = user.get("name", "").split()[0] if user.get("name") else "there"
-        return f"""Hi {name}! I'm Hisaab, your expense assistant.
+        return f"""Hi {name}\! 👋 I'm Hisaab, your expense assistant\.
 
-Here's what you can ask me:
-• *summary* — spending overview
-• *this month* — current month spend
-• *last month* — previous month
+Here's what you can ask:
+• *summary* — 30\-day spending overview
 • How much did I spend on food?
 • What are my subscriptions?
 • Any unusual transactions?
+• Which merchant did I spend most on?
 
 What would you like to know?"""
 
-    if message_lower in ["summary", "show summary", "spending summary"]:
+    if message_lower in ["summary", "/summary"]:
         return await generate_summary(user)
 
-    # AI-powered chat for everything else
-    save_message(whatsapp_number, "user", message)
-    history = get_recent_messages(whatsapp_number, limit=8)
+    save_message(user_id, "user", message)
+    history = get_recent_messages(user_id, limit=8)
 
     try:
         transactions = get_transactions(
@@ -94,12 +85,12 @@ What would you like to know?"""
         reply = await generate_reply(transactions, history, message)
     except Exception as e:
         if "401" in str(e) or "403" in str(e):
-            auth_url = f"{BACKEND_URL}/auth/google?number={whatsapp_number}"
-            reply = f"Your Gmail access expired. Please reconnect:\n{auth_url}"
+            auth_url = f"{BACKEND_URL}/auth/google?number={user_id}"
+            reply = f"Your Gmail access expired\. Please reconnect:\n{auth_url}"
         else:
-            reply = "Sorry, I had trouble reading your emails. Please try again in a moment."
+            reply = f"Sorry, something went wrong\. Please try again\."
 
-    save_message(whatsapp_number, "assistant", reply)
+    save_message(user_id, "assistant", reply)
     return reply
 
 async def generate_summary(user: dict) -> str:
@@ -110,12 +101,18 @@ async def generate_summary(user: dict) -> str:
             days=30
         )
         if not transactions:
-            return "I couldn't find any bank transactions in the last 30 days. Make sure your bank sends email alerts."
+            return """I couldn't find any bank transactions in the last 30 days\.
 
-        total = sum(t["amount"] for t in transactions if t.get("amount"))
+Possible reasons:
+• Your bank alert emails are in a different Gmail account
+• Your bank doesn't send email alerts \(enable them in net banking\)
+• Emails might be in spam
+
+Which bank do you use? I'll help check\."""
+
+        total = sum(t["amount"] for t in transactions)
         count = len(transactions)
 
-        # Group by merchant
         merchant_totals = {}
         for t in transactions:
             m = t.get("merchant", "Unknown")
@@ -124,26 +121,24 @@ async def generate_summary(user: dict) -> str:
         top = sorted(merchant_totals.items(), key=lambda x: x[1], reverse=True)[:5]
         top_lines = "\n".join([f"  • {m}: ₹{round(amt):,}" for m, amt in top])
 
-        # Group by mode
         mode_totals = {}
         for t in transactions:
             mode = t.get("mode", "Other")
             mode_totals[mode] = mode_totals.get(mode, 0) + t.get("amount", 0)
-
         mode_lines = "\n".join([f"  • {m}: ₹{round(amt):,}" for m, amt in sorted(mode_totals.items(), key=lambda x: x[1], reverse=True)])
 
-        return f"""*Your 30-day Spending Summary*
+        return f"""📊 *Your 30\-day Summary*
 
-Total spent: *₹{round(total):,}*
-Transactions: {count}
+💰 Total spent: *₹{round(total):,}*
+📝 Transactions: {count}
 
-*Top merchants:*
+🏪 *Top merchants:*
 {top_lines}
 
-*By payment mode:*
+💳 *By payment mode:*
 {mode_lines}
 
-Ask me anything — "how much on food?", "any big transactions?", "compare this week vs last week" """
+Ask me anything — "food spend?", "big transactions?", "compare this week vs last" """
 
     except Exception as e:
-        return f"Couldn't fetch your summary right now. Try again in a moment."
+        return f"Couldn't fetch your summary right now\. Please try again\."
