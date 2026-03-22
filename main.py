@@ -73,8 +73,10 @@ async def telegram_webhook(request: Request):
         reply, keyboard = await handle_message(user_id, text)
         await send_telegram(chat_id, reply, keyboard)
     except Exception as e:
-        send_admin_alert(f"🚨 *Error for user {user_id[:4]}\\.\\.\\.*\n\n`{sanitise_log(str(e)[:200])}`")
-        await send_telegram(chat_id, "Something went wrong\\. Please try again\\.")
+        import traceback
+        err = traceback.format_exc()
+        print(f"ERROR: {err}")
+        await send_telegram(chat_id, f"Debug error: {str(e)[:300]}")
 
     return {"ok": True}
 
