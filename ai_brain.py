@@ -1,62 +1,118 @@
 """
-AI brain — Claude-powered conversation about user's spending
+AI Brain — Claude-powered conversation with data minimisation
+Only sends relevant transactions based on the user's question
 """
-import os
-import requests
+import os, requests, re
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 
-def build_system_prompt(transactions: list) -> str:
+CATEGORY_KEYWORDS = {
+    "food": ["Food & Dining", "Groceries"],
+    "restaurant": ["Food & Dining"],
+    "zomato": ["Food & Dining"], "swiggy": ["Food & Dining"],
+    "grocery": ["Groceries"], "bigbasket": ["Groceries"],
+    "travel": ["Travel & Transport"], "transport": ["Travel & Transport"],
+    "uber": ["Travel & Transport"], "ola": ["Travel & Transport"],
+    "fuel": ["Fuel"], "petrol": ["Fuel"],
+    "entertainment": ["Entertainment & OTT"], "ott": ["Entertainment & OTT"],
+    "netflix": ["Entertainment & OTT"], "hotstar": ["Entertainment & OTT"],
+    "health": ["Health & Medical"], "medical": ["Health & Medical"], "doctor": ["Health & Medical"],
+    "bill": ["Utilities & Bills"], "recharge": ["Utilities & Bills"], "electricity": ["Utilities & Bills"],
+    "subscription": ["Subscriptions"],
+    "shopping": ["Shopping"], "amazon": ["Shopping"], "flipkart": ["Shopping"],
+    "invest": ["Investments & Finance"], "sip": ["Investments & Finance"], "mutual fund": ["Investments & Finance"],
+    "insurance": ["Insurance"],
+    "emi": ["EMI & Loans"], "loan": ["EMI & Loans"],
+    "education": ["Education"],
+    "rent": ["Rent"],
+    "upi": None,  # All UPI transactions
+    "transfer": ["P2P Transfer", "Daily Spend"],
+}
+
+def get_relevant_categories(question: str) -> list:
+    """Extract relevant categories from user question."""
+    question_lower = question.lower()
+    categories = set()
+    for keyword, cats in CATEGORY_KEYWORDS.items():
+        if keyword in question_lower and cats:
+            categories.update(cats)
+    return list(categories) if categories else None  # None = all categories
+
+def filter_transactions(transactions: list, question: str) -> list:
+    """Filter transactions by relevance to question — data minimisation."""
+    relevant_cats = get_relevant_categories(question)
+
+    # If asking about specific time period already filtered by DB query
+    # If asking about specific category, filter by it
+    if relevant_cats:
+        filtered = [t for t in transactions if t.get("category") in relevant_cats]
+        # If filter returns too few, return all (fallback)
+        return filtered if len(filtered) >= 3 else transactions
+
+    return transactions
+
+def build_system_prompt(transactions: list, label: str = "Last 30 days") -> str:
     if not transactions:
-        return """You are Hisaab, a friendly WhatsApp expense assistant for Indian users.
-No transactions found. Tell the user politely and suggest they check their bank email alerts are enabled.
-Keep responses under 200 words. Use ₹ for amounts. Be warm and conversational."""
+        return f"""You are Hisaab, a friendly Indian expense assistant on Telegram.
+No transactions found for {label}. Tell user to try 'sync' or check Gmail connection.
+Keep responses under 150 words. Use ₹ for amounts."""
 
-    total = sum(t.get("amount", 0) for t in transactions)
-    merchant_totals = {}
-    mode_totals = {}
+    total = sum(t.get("amount", 0) for t in transactions if t.get("treatment") == "spend")
+    invested = sum(t.get("amount", 0) for t in transactions if t.get("treatment") == "investment")
 
+    cat_totals = {}
     for t in transactions:
-        m = t.get("merchant", "Unknown")
-        merchant_totals[m] = merchant_totals.get(m, 0) + t.get("amount", 0)
-        mode = t.get("mode", "Other")
-        mode_totals[mode] = mode_totals.get(mode, 0) + t.get("amount", 0)
+        if t.get("treatment") == "spend":
+            cat = t.get("category", "Other")
+            cat_totals[cat] = cat_totals.get(cat, 0) + t.get("amount", 0)
 
-    top_merchants = sorted(merchant_totals.items(), key=lambda x: x[1], reverse=True)[:10]
+    top_cats = sorted(cat_totals.items(), key=lambda x: x[1], reverse=True)
+    cat_lines = "\n".join([f"- {c}: ₹{round(a):,}" for c, a in top_cats])
+
+    merchant_totals = {}
+    for t in transactions:
+        if t.get("treatment") == "spend":
+            m = t.get("merchant", "Unknown")
+            merchant_totals[m] = merchant_totals.get(m, 0) + t.get("amount", 0)
+
+    top_merchants = sorted(merchant_totals.items(), key=lambda x: x[1], reverse=True)[:8]
+    merchant_lines = "\n".join([f"- {m}: ₹{round(a):,}" for m, a in top_merchants])
+
+    recent = transactions[:20]
     txn_lines = "\n".join([
-        f"- {t['date']} | {t['bank']} | {t['mode']} | {t['merchant']} | ₹{t['amount']}"
-        for t in transactions[:50]
+        f"- {t.get('date','')} | {t.get('category','')} | {t.get('merchant','?')} | ₹{t.get('amount',0)}"
+        for t in recent
     ])
-    merchant_lines = "\n".join([f"- {m}: ₹{round(a)}" for m, a in top_merchants])
-    mode_lines = "\n".join([f"- {m}: ₹{round(a)}" for m, a in mode_totals.items()])
 
-    return f"""You are Hisaab, a friendly WhatsApp expense assistant for Indian users.
-Answer questions based ONLY on the transaction data below.
+    return f"""You are Hisaab, a friendly Indian personal finance assistant on Telegram.
+Period: {label}
 
-SUMMARY:
-- Total transactions: {len(transactions)}
-- Total spend: ₹{round(total):,}
+SPEND TOTAL: ₹{round(total):,} across {len([t for t in transactions if t.get('treatment')=='spend'])} transactions
+INVESTED: ₹{round(invested):,}
+
+BY CATEGORY:
+{cat_lines}
 
 TOP MERCHANTS:
 {merchant_lines}
 
-BY PAYMENT MODE:
-{mode_lines}
-
-ALL TRANSACTIONS (last 50):
+RECENT TRANSACTIONS:
 {txn_lines}
 
 RULES:
-- Keep replies under 200 words (WhatsApp messages should be short)
-- Use ₹ for amounts, format numbers with commas
-- Be warm and conversational, like a knowledgeable friend
-- If asked about something not in the data, say so clearly
-- For UPI payments under ₹500 with unknown merchants, group as "small daily spends"
-- Always end with a follow-up question or suggestion"""
+- Keep replies under 150 words
+- Use ₹ with commas (₹1,234)
+- Be warm like a knowledgeable friend
+- Investments shown separately, not in spend total
+- Credit card payments and EMIs are excluded from totals (they are settlements)
+- For date comparisons use transaction dates
+- Use Telegram markdown: *bold*"""
 
-async def generate_reply(transactions: list, history: list, user_message: str) -> str:
-    system = build_system_prompt(transactions)
-    messages = history + [{"role": "user", "content": user_message}]
+async def generate_reply(transactions: list, history: list, user_message: str, label: str = "Last 30 days") -> str:
+    # Data minimisation — only send relevant transactions
+    filtered = filter_transactions(transactions, user_message)
+    system = build_system_prompt(filtered, label)
+    messages = history[-6:] + [{"role": "user", "content": user_message}]
 
     resp = requests.post(
         "https://api.anthropic.com/v1/messages",
@@ -66,8 +122,8 @@ async def generate_reply(transactions: list, history: list, user_message: str) -
             "content-type": "application/json",
         },
         json={
-            "model": "claude-sonnet-4-20250514",
-            "max_tokens": 500,
+            "model": "claude-haiku-4-5-20251001",
+            "max_tokens": 400,
             "system": system,
             "messages": messages,
         }
