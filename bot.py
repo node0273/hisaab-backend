@@ -171,7 +171,9 @@ You can connect up to 3 Gmail accounts\. Currently connected: {len(accounts)}/3"
         transactions = get_transactions(user_id, gmail_accounts, days=90)
         reply = await generate_reply(transactions, history, message)
     except Exception as e:
-        reply = f"Something went wrong\. Please try again\."
+        import traceback
+        print(f"BOT ERROR for {user_id}: {traceback.format_exc()}")
+        reply = f"Error: {str(e)[:300]}"
 
     save_message(user_id, "assistant", reply)
     return reply, None
@@ -286,4 +288,6 @@ async def generate_period_summary(user_id: str, gmail_accounts: list, start_date
 Ask me anything — "food spend?", "any subscriptions?", "compare with last month" """
 
     except Exception as e:
-        return f"Error generating summary\. Please try again\."
+        import traceback
+        print(f"SUMMARY ERROR: {traceback.format_exc()}")
+        return f"Error: {str(e)[:300]}"
