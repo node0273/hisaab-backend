@@ -36,10 +36,11 @@ def health():
 
 @app.post("/webhook/telegram")
 async def telegram_webhook(request: Request):
-    # Validate request is from Telegram
-    secret_header = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-    if secret_header != WEBHOOK_SECRET:
-        return {"ok": False, "error": "Unauthorized"}
+    # Validate request is from Telegram (only if WEBHOOK_SECRET is set)
+    if WEBHOOK_SECRET:
+        secret_header = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if secret_header and secret_header != WEBHOOK_SECRET:
+            return {"ok": False, "error": "Unauthorized"}
 
     data = await request.json()
 
