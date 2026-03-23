@@ -163,12 +163,16 @@ You can connect up to 3 Gmail accounts. Currently connected: {len(accounts)}/3""
         start, end, label = parse_time_period(message_lower)
         return await generate_period_summary(user_id, gmail_accounts, start, end, label), None
 
-    # AI chat
+    # AI chat - load from DB only (no sync on every message)
     save_message(user_id, "user", message)
     history = get_recent_messages(user_id, limit=6)
 
     try:
-        transactions = get_transactions(user_id, gmail_accounts, days=90)
+        from db import get_transactions_from_db
+        transactions = get_transactions_from_db(user_id, days=90)
+        if not transactions:
+            # No transactions yet - trigger sync
+            transactions = get_transactions(user_id, gmail_accounts, days=90)
         reply = await generate_reply(transactions, history, message)
     except Exception as e:
         import traceback

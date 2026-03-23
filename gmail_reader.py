@@ -10,7 +10,7 @@ Architecture:
 import base64, re, os, requests, json
 from datetime import datetime, timedelta
 from rules_engine import get_bank_from_sender, get_bank_from_keywords, get_merchant_from_vpa, get_merchant_from_nach, ensure_rules_tables, seed_rules_from_config
-from bank_config import MODE_KEYWORDS
+from bank_config import MODE_KEYWORDS, BANK_SENDERS
 from db import get_last_sync, update_sync_log, save_transactions, update_access_token, get_conn
 from merchant_resolver import resolve_merchant
 

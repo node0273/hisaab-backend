@@ -22,8 +22,11 @@ async def send_telegram(chat_id: int, text: str, reply_markup=None):
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
     if reply_markup:
         payload["reply_markup"] = {"inline_keyboard": reply_markup}
-    async with httpx.AsyncClient() as client:
-        await client.post(f"{TELEGRAM_API}/sendMessage", json=payload)
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            await client.post(f"{TELEGRAM_API}/sendMessage", json=payload)
+    except Exception as e:
+        print(f"send_telegram error: {str(e)[:100]}")
 
 @app.get("/")
 def root():
