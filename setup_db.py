@@ -296,7 +296,9 @@ print(f"   Categories: {len(categories)} seeded")
 print(f"   Merchants: {len(merchants)} seeded")
 
 # ── Rules tables (added in v3) ────────────────────────────────
-cur.execute("""
+conn2 = psycopg2.connect(DATABASE_URL)
+cur2 = conn2.cursor()
+cur2.execute("""
 CREATE TABLE IF NOT EXISTS bank_senders (
     id SERIAL PRIMARY KEY,
     sender_email VARCHAR(255) UNIQUE NOT NULL,
@@ -336,5 +338,7 @@ CREATE TABLE IF NOT EXISTS learned_senders (
     discovered_at TIMESTAMPTZ DEFAULT NOW()
 );
 """)
-conn.commit()
+conn2.commit()
+cur2.close()
+conn2.close()
 print("   Rules tables: bank_senders, vpa_rules, nach_rules, learned_senders")
