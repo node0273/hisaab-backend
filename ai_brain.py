@@ -78,9 +78,23 @@ Keep responses under 150 words. Use ₹ for amounts."""
     top_merchants = sorted(merchant_totals.items(), key=lambda x: x[1], reverse=True)[:8]
     merchant_lines = "\n".join([f"- {m}: ₹{round(a):,}" for m, a in top_merchants])
 
-    recent = transactions[:20]
+    # Bank-wise breakdown
+    bank_totals = {}
+    bank_modes = {}
+    for t in transactions:
+        if t.get("treatment") == "spend":
+            bank = t.get("bank", "Unknown")
+            bank_totals[bank] = bank_totals.get(bank, 0) + t.get("amount", 0)
+            mode = t.get("mode", "Unknown")
+            key = f"{bank}:{mode}"
+            bank_modes[key] = bank_modes.get(key, 0) + t.get("amount", 0)
+
+    bank_lines = "\n".join([f"- {b}: ₹{round(a):,}" for b, a in sorted(bank_totals.items(), key=lambda x: x[1], reverse=True)])
+    bank_mode_lines = "\n".join([f"- {k}: ₹{round(a):,}" for k, a in sorted(bank_modes.items(), key=lambda x: x[1], reverse=True)[:10]])
+
+    recent = transactions[:30]
     txn_lines = "\n".join([
-        f"- {t.get('date','')} | {t.get('category','')} | {t.get('merchant','?')} | ₹{t.get('amount',0)}"
+        f"- {t.get('date','')} | {t.get('bank','')} | {t.get('mode','')} | {t.get('category','')} | {t.get('merchant','?')} | ₹{t.get('amount',0)}"
         for t in recent
     ])
 
@@ -96,7 +110,13 @@ BY CATEGORY:
 TOP MERCHANTS:
 {merchant_lines}
 
-RECENT TRANSACTIONS:
+BY BANK:
+{bank_lines}
+
+BY BANK + MODE:
+{bank_mode_lines}
+
+RECENT TRANSACTIONS (date | bank | mode | category | merchant | amount):
 {txn_lines}
 
 RULES:
