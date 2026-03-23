@@ -1,25 +1,26 @@
 """
-Gmail Reader v4 — Smart, rule-based first, AI only for unknowns
+Gmail Reader v5 — Fully DB-driven, no hardcoding
 Architecture:
-1. Search Gmail for all bank emails (known senders + broad keywords)
-2. Identify bank from sender (rule-based, instant)
-3. Extract transaction details (rule-based for known banks, AI for others)
-4. Resolve merchant from VPA/name (rule-based first, AI only for unknowns)
-5. Store everything — never re-process same email
+1. Read ALL emails broadly (no hardcoded sender list)
+2. Check negative_rules table → skip promotional/spam senders forever
+3. Check bank_senders table → identify bank (known senders)
+4. If unknown sender → AI decides: bank transaction / promotional / irrelevant
+   - Bank transaction → extract details, save sender to bank_senders
+   - Promotional → save to negative_rules, never read again
+   - Irrelevant → save to negative_rules
+5. Extract transaction: rule-based first (vpa_rules, nach_rules), AI if no rule
+6. New rule learned → saved to DB permanently
 """
 import base64, re, os, requests, json
 from datetime import datetime, timedelta
-from rules_engine import get_bank_from_sender, get_bank_from_keywords, get_merchant_from_vpa, get_merchant_from_nach, ensure_rules_tables, seed_rules_from_config
-from bank_config import MODE_KEYWORDS, BANK_SENDERS
 from db import get_last_sync, update_sync_log, save_transactions, update_access_token, get_conn
-from merchant_resolver import resolve_merchant
 
 GMAIL_API = "https://gmail.googleapis.com/gmail/v1/users/me"
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 
-# ── Gmail API helpers ─────────────────────────────────────────
+# ── Gmail helpers ─────────────────────────────────────────────
 
 def refresh_access_token(refresh_token: str) -> str:
     resp = requests.post("https://oauth2.googleapis.com/token", data={
@@ -67,7 +68,7 @@ def get_body(msg):
         body = decode_body(payload["body"]["data"])
     elif payload.get("parts"):
         body = walk(payload["parts"])
-    return (body + " " + msg.get("snippet", ""))[:2500]
+    return (body + " " + msg.get("snippet", ""))[:3000]
 
 def extract_sender_email(from_header: str) -> str:
     m = re.search(r'<([^>]+)>', from_header)
@@ -76,70 +77,212 @@ def extract_sender_email(from_header: str) -> str:
 def parse_email_date(msg):
     date_str = get_header(msg, "Date")
     for fmt in ["%a, %d %b %Y %H:%M:%S %z", "%d %b %Y %H:%M:%S %z",
-                "%a, %d %b %Y %H:%M:%S %Z", "%d %b %Y %H:%M:%S %Z"]:
+                "%a, %d %b %Y %H:%M:%S %Z"]:
         try:
             return datetime.strptime(date_str[:35].strip(), fmt).date()
         except:
             pass
     return datetime.now().date()
 
-# ── Bank identification ───────────────────────────────────────
+# ── DB helpers for rules ──────────────────────────────────────
 
-def identify_bank(sender_email: str, subject: str, body: str) -> str:
-    """Identify bank using rules engine (DB + fallback to bank_config)."""
-    bank = get_bank_from_sender(sender_email)
-    if bank:
-        return bank
-    return get_bank_from_keywords(subject, body)
+def ensure_tables():
+    """Ensure all required tables exist."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS bank_senders (
+                    id SERIAL PRIMARY KEY,
+                    sender_email VARCHAR(255) UNIQUE NOT NULL,
+                    bank_name VARCHAR(100) NOT NULL,
+                    is_active BOOLEAN DEFAULT TRUE,
+                    source VARCHAR(20) DEFAULT 'ai',
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                );
+                CREATE TABLE IF NOT EXISTS negative_rules (
+                    id SERIAL PRIMARY KEY,
+                    sender_email VARCHAR(255) UNIQUE NOT NULL,
+                    reason VARCHAR(255),
+                    source VARCHAR(20) DEFAULT 'ai',
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                );
+                CREATE TABLE IF NOT EXISTS vpa_rules (
+                    id SERIAL PRIMARY KEY,
+                    keyword VARCHAR(255) UNIQUE NOT NULL,
+                    merchant_canonical VARCHAR(255) NOT NULL,
+                    category VARCHAR(100) NOT NULL,
+                    treatment VARCHAR(20) DEFAULT 'spend',
+                    is_active BOOLEAN DEFAULT TRUE,
+                    source VARCHAR(20) DEFAULT 'manual',
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                );
+                CREATE TABLE IF NOT EXISTS nach_rules (
+                    id SERIAL PRIMARY KEY,
+                    keyword VARCHAR(255) UNIQUE NOT NULL,
+                    merchant_canonical VARCHAR(255) NOT NULL,
+                    category VARCHAR(100) NOT NULL,
+                    treatment VARCHAR(20) DEFAULT 'spend',
+                    is_active BOOLEAN DEFAULT TRUE,
+                    source VARCHAR(20) DEFAULT 'manual',
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                );
+                CREATE TABLE IF NOT EXISTS learned_senders (
+                    id SERIAL PRIMARY KEY,
+                    sender_email VARCHAR(255) UNIQUE NOT NULL,
+                    bank_name VARCHAR(100) NOT NULL,
+                    is_active BOOLEAN DEFAULT TRUE,
+                    discovered_at TIMESTAMPTZ DEFAULT NOW()
+                );
+            """)
+            conn.commit()
 
-# ── Rule-based transaction extraction ─────────────────────────
+def get_all_bank_senders() -> dict:
+    """Load all known bank senders from DB."""
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT sender_email, bank_name FROM bank_senders WHERE is_active = TRUE")
+                return {r[0]: r[1] for r in cur.fetchall()}
+    except:
+        return {}
+
+def get_negative_senders() -> set:
+    """Load all promotional/spam senders to skip."""
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT sender_email FROM negative_rules")
+                return {r[0] for r in cur.fetchall()}
+    except:
+        return set()
+
+def save_bank_sender(sender_email: str, bank_name: str, source: str = 'ai'):
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO bank_senders (sender_email, bank_name, source)
+                    VALUES (%s, %s, %s) ON CONFLICT (sender_email) DO NOTHING
+                """, (sender_email, bank_name, source))
+                conn.commit()
+        print(f"Learned bank sender: {sender_email} → {bank_name}")
+    except Exception as e:
+        print(f"save_bank_sender error: {e}")
+
+def save_negative_rule(sender_email: str, reason: str, source: str = 'ai'):
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO negative_rules (sender_email, reason, source)
+                    VALUES (%s, %s, %s) ON CONFLICT (sender_email) DO NOTHING
+                """, (sender_email, reason, source))
+                conn.commit()
+        print(f"Negative rule saved: {sender_email} → {reason}")
+    except Exception as e:
+        print(f"save_negative_rule error: {e}")
+
+def seed_bank_senders():
+    """Seed DB with known bank senders if empty."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM bank_senders")
+            if cur.fetchone()[0] > 0:
+                return
+
+    # Seed from bank_config fallback
+    try:
+        from bank_config import BANK_SENDERS
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                for email, bank in BANK_SENDERS.items():
+                    cur.execute("""
+                        INSERT INTO bank_senders (sender_email, bank_name, source)
+                        VALUES (%s, %s, 'seed') ON CONFLICT DO NOTHING
+                    """, (email, bank))
+                conn.commit()
+        print(f"Seeded {len(BANK_SENDERS)} bank senders from config")
+    except Exception as e:
+        print(f"Seed error: {e}")
+
+def get_vpa_rules() -> dict:
+    """Load VPA rules from DB."""
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT keyword, merchant_canonical, category, treatment FROM vpa_rules WHERE is_active = TRUE")
+                return {r[0]: (r[1], r[2], r[3]) for r in cur.fetchall()}
+    except:
+        return {}
+
+def get_nach_rules() -> dict:
+    """Load NACH rules from DB."""
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT keyword, merchant_canonical, category, treatment FROM nach_rules WHERE is_active = TRUE")
+                return {r[0]: (r[1], r[2], r[3]) for r in cur.fetchall()}
+    except:
+        return {}
+
+def seed_vpa_nach_rules():
+    """Seed VPA and NACH rules from bank_config if empty."""
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM vpa_rules")
+                if cur.fetchone()[0] > 0:
+                    return
+
+        from bank_config import VPA_MERCHANT_MAP, NACH_MERCHANT_MAP
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                for kw, result in VPA_MERCHANT_MAP.items():
+                    if result:
+                        cur.execute("""
+                            INSERT INTO vpa_rules (keyword, merchant_canonical, category, treatment, source)
+                            VALUES (%s, %s, %s, %s, 'seed') ON CONFLICT DO NOTHING
+                        """, (kw, result[0], result[1], result[2]))
+                for kw, result in NACH_MERCHANT_MAP.items():
+                    cur.execute("""
+                        INSERT INTO nach_rules (keyword, merchant_canonical, category, treatment, source)
+                        VALUES (%s, %s, %s, %s, 'seed') ON CONFLICT DO NOTHING
+                    """, (kw, result[0], result[1], result[2]))
+                conn.commit()
+        print("Seeded VPA and NACH rules")
+    except Exception as e:
+        print(f"Seed VPA/NACH error: {e}")
+
+# ── Amount extraction ─────────────────────────────────────────
 
 def extract_amount(text: str) -> float:
-    """Extract rupee amount from text."""
+    """Extract amount — handles Rs., INR, ₹ formats."""
     patterns = [
         r'(?:Rs\.?|INR|₹)\s*([\d,]+\.?\d*)',
+        r'for\s+INR\s+([\d,]+\.?\d*)',
         r'([\d,]+\.?\d*)\s*(?:rupees|rs\.?)',
         r'amount[:\s]+(?:Rs\.?|INR|₹)?\s*([\d,]+\.?\d*)',
         r'debited.*?(?:Rs\.?|INR|₹)\s*([\d,]+\.?\d*)',
+        r'(?:Rs\.?|INR|₹)\s*([\d,]+\.?\d*)\s+(?:has been|was)',
     ]
     for pattern in patterns:
         m = re.search(pattern, text, re.IGNORECASE)
         if m:
             try:
-                return float(m.group(1).replace(",", ""))
+                val = float(m.group(1).replace(",", ""))
+                if val > 0:
+                    return val
             except:
                 pass
     return None
 
-def detect_mode(subject: str, body: str) -> str:
-    """Detect transaction mode from email content."""
-    text = (subject + " " + body[:500]).lower()
-    for mode, keywords in MODE_KEYWORDS.items():
-        if any(kw in text for kw in keywords):
-            return mode
-    return "Unknown"
-
-def is_debit(subject: str, body: str) -> bool:
-    """Check if transaction is a debit (money going out)."""
-    text = (subject + " " + body[:500]).lower()
-    debit_keywords = ["debited", "debit", "spent", "payment of", "paid", "purchase", "withdrawn", "transaction of"]
-    credit_keywords = ["credited", "credit", "received", "refund", "cashback", "salary", "deposit"]
-    
-    debit_score = sum(1 for kw in debit_keywords if kw in text)
-    credit_score = sum(1 for kw in credit_keywords if kw in text)
-    
-    # If more credit keywords, it's not a debit
-    if credit_score > debit_score:
-        return False
-    return True
-
 def extract_vpa(text: str) -> str:
-    """Extract UPI VPA from text."""
+    """Extract UPI VPA handle."""
     patterns = [
         r'VPA\s+([\w.\-@]+)',
         r'to\s+([\w.\-]+@[\w.\-]+)',
         r'UPI\s+ID[:\s]+([\w.\-@]+)',
-        r'([\w.\-]+@(?:okaxis|okhdfcbank|okicici|oksbi|paytm|gpay|ybl|axl|pty|ptyes|ibl|digikhata|jiopay|hdfcbank|icici|sbi|axisbank))',
+        r'([\w.\-]+@(?:okaxis|okhdfcbank|okicici|oksbi|paytm|gpay|ybl|axl|pty|ptyes|ibl|digikhata|jiopay|hdfcbank|icici|sbi|axisbank|kotak|indus|federal|rbl|yesbank))',
     ]
     for pattern in patterns:
         m = re.search(pattern, text, re.IGNORECASE)
@@ -147,140 +290,109 @@ def extract_vpa(text: str) -> str:
             return m.group(1).strip().lower()
     return ""
 
-def resolve_vpa_merchant(vpa: str) -> tuple:
-    """Resolve VPA using rules engine."""
-    return get_merchant_from_vpa(vpa)
+def clean_merchant(name: str) -> str:
+    """Strip payment gateway prefixes: PYU*ZOMATO → ZOMATO."""
+    if not name:
+        return name
+    name = re.sub(r'^[A-Z]{2,4}\*', '', name).strip()
+    name = re.sub(r'\s+[A-Z]{2,}\s+IN$', '', name).strip()
+    return name
 
-def extract_nach_merchant(body: str) -> tuple:
-    """Extract NACH merchant using rules engine."""
-    result = get_merchant_from_nach(body)
-    if result:
-        return result
-    # Fallback: try to extract company name
-    patterns = [
-        r'towards\s+([A-Z][A-Za-z\s]+?)\s+(?:with|for|on|dated)',
-        r'mandate.*?for\s+([A-Z][A-Za-z\s]+?)\s*(?:\n|with|for)',
-    ]
-    for pattern in patterns:
-        m = re.search(pattern, body, re.IGNORECASE)
-        if m:
-            return m.group(1).strip(), "Other", "spend"
+def is_debit(subject: str, body: str) -> bool:
+    text = (subject + " " + body[:500]).lower()
+    credits = ["credited", "credit", "received", "refund", "cashback", "salary", "otp", "one time", "password", "login", "sign in", "statement", "balance is", "available balance", "reward", "offer", "due date", "minimum due", "bill generated"]
+    debits = ["debited", "debit", "spent", "payment of", "paid", "purchase", "withdrawn", "transaction of", "used for", "has been used"]
+    c = sum(1 for kw in credits if kw in text)
+    d = sum(1 for kw in debits if kw in text)
+    return d > c
+
+def detect_mode(text: str) -> str:
+    t = text.lower()
+    if any(k in t for k in ["upi", "vpa", "bhim", "gpay", "phonepe", "paytm upi"]): return "UPI"
+    if any(k in t for k in ["credit card", " cc ", "visa", "mastercard", "rupay", "amex"]): return "Credit Card"
+    if any(k in t for k in ["debit card", "atm", " pos "]): return "Debit Card"
+    if any(k in t for k in ["nach", "ach", "mandate", "ecs", "auto debit"]): return "NACH"
+    if any(k in t for k in ["neft", "rtgs", "imps", "net banking"]): return "Net Banking"
+    return "Unknown"
+
+# ── VPA merchant resolution ───────────────────────────────────
+
+def resolve_vpa(vpa: str, amount: float, vpa_rules: dict) -> tuple:
+    """
+    Resolve VPA to merchant using DB rules.
+    Returns (canonical, category, treatment, person_name)
+    """
+    if not vpa:
+        return None
+
+    handle = vpa.split("@")[0].lower()
+    handle_clean = re.sub(r'[^a-z0-9]', '', handle)
+
+    # Check DB VPA rules
+    for keyword, result in vpa_rules.items():
+        if keyword in handle_clean or keyword in handle:
+            return result[0], result[1], result[2], ""
+
+    # Person detection
+    is_phone = bool(re.match(r'^\d{10}$', handle))
+    is_name = bool(re.match(r'^[a-z]+[.\-][a-z]+\d{0,4}$', handle))
+
+    if is_phone or is_name:
+        name = f"****{handle[-4:]}" if is_phone else re.sub(r'[._\-]', ' ', handle).title()
+        category = "Daily Spend" if amount < 500 else "P2P Transfer"
+        return f"P2P - {name}", category, "spend", name
+
+    return None
+
+def resolve_nach(body: str, nach_rules: dict) -> tuple:
+    """Resolve NACH merchant using DB rules."""
+    body_lower = body.lower()
+    for keyword, result in nach_rules.items():
+        if keyword in body_lower:
+            return result[0], result[1], result[2]
+    # Extract company name from body
+    m = re.search(r'towards\s+([A-Z][A-Za-z\s]+?)\s+(?:with|for|on|dated)', body, re.IGNORECASE)
+    if m:
+        return m.group(1).strip(), "Other", "spend"
     return "NACH Payment", "Other", "spend"
 
-def rule_based_extract(subject: str, body: str, bank: str) -> dict:
-    """
-    Rule-based extraction — handles 80% of transactions.
-    Returns dict or None.
-    """
-    text = subject + " " + body
-    
-    # Skip non-transaction emails
-    skip_keywords = [
-        "otp", "one time password", "login", "sign in", "statement",
-        "account opening", "welcome", "kyc", "update your", "verify",
-        "reminder", "due date", "minimum due", "bill generated",
-        "credit limit", "reward points", "offers", "cashback earned",
-        "balance is", "available balance", "account balance"
-    ]
-    text_lower = text.lower()
-    if any(kw in text_lower for kw in skip_keywords):
-        return None
-    
-    # Must be a debit
-    if not is_debit(subject, body):
-        return None
-    
-    amount = extract_amount(text)
-    if not amount or amount <= 0:
-        return None
-    
-    mode = detect_mode(subject, body)
-    vpa = ""
-    merchant_raw = ""
-    merchant_canonical = "Unknown"
-    category = "Other"
-    treatment = "spend"
-    person_name = ""
-    
-    if mode == "UPI":
-        vpa = extract_vpa(text)
-        result = resolve_vpa_merchant(vpa) if vpa else None
-        
-        if result and result[0] is not None:
-            # Business VPA resolved
-            merchant_canonical, category, treatment, person_name = result
-            merchant_raw = vpa
-        elif result and result[0] is None and result[3]:
-            # Person VPA
-            person_name = result[3]
-            merchant_canonical = f"P2P - {person_name}"
-            category = "Daily Spend" if amount < 500 else "P2P Transfer"
-            treatment = "spend"
-            merchant_raw = vpa
-        else:
-            # Unknown VPA — use full VPA as raw name for AI resolution
-            merchant_raw = vpa
-            merchant_canonical = None  # Signal AI needed
-    
-    elif mode == "Credit Card":
-        # Extract merchant from "at MERCHANT_NAME on DATE" pattern
-        patterns = [
-            r'(?:at|towards|for)\s+([A-Z][A-Za-z0-9\s\*\-\.]+?)\s+(?:on|for|dated|\d)',
-            r'purchase.*?at\s+([A-Z][A-Za-z0-9\s\*\-\.]+)',
-            r'spent.*?at\s+([A-Z][A-Za-z0-9\s\*\-\.]+)',
-        ]
-        for pattern in patterns:
-            m = re.search(pattern, text, re.IGNORECASE)
-            if m:
-                merchant_raw = m.group(1).strip()
-                break
-        merchant_canonical = None  # Will be resolved by merchant_resolver
-    
-    elif mode == "NACH":
-        merchant_raw, category, treatment = extract_nach_merchant(body)
-        merchant_canonical = merchant_raw
-    
-    elif mode == "Debit Card":
-        patterns = [
-            r'(?:at|pos)\s+([A-Z][A-Za-z0-9\s\*\-\.]+?)\s+(?:on|for|\d)',
-        ]
-        for pattern in patterns:
-            m = re.search(pattern, text, re.IGNORECASE)
-            if m:
-                merchant_raw = m.group(1).strip()
-                break
-        merchant_canonical = None
-    
-    return {
-        "amount": amount,
-        "mode": mode,
-        "vpa": vpa,
-        "merchant_raw": merchant_raw,
-        "merchant_canonical": merchant_canonical,
-        "category": category,
-        "treatment": treatment,
-        "person_name": person_name,
-        "needs_ai": merchant_canonical is None,
-    }
+# ── AI calls ──────────────────────────────────────────────────
 
-def ai_extract_transaction(subject: str, body: str, bank: str) -> dict:
-    """AI extraction — only called when rule-based fails."""
+def ai_classify_email(subject: str, body: str, sender: str) -> dict:
+    """
+    AI classifies email as:
+    - bank_transaction: extract details
+    - promotional: add to negative_rules
+    - irrelevant: add to negative_rules
+    Returns dict with 'type' and optional transaction details
+    """
     if not ANTHROPIC_API_KEY:
-        return None
-    
-    prompt = f"""Extract transaction from this {bank} bank alert email.
+        return {"type": "irrelevant"}
 
+    prompt = f"""Classify this email and extract data if it's a bank transaction.
+
+From: {sender}
 Subject: {subject}
-Body: {body[:1200]}
+Body: {body[:1500]}
 
-Rules:
-- Only extract DEBIT transactions (money going OUT)
-- Skip: OTP, login, balance alerts, statements, welcome emails
-- For UPI: extract the full VPA handle (e.g. zomato@icici)
-- Amount must be positive number
+Classify as exactly one of:
+1. "bank_transaction" - a debit/credit alert from a bank
+2. "promotional" - marketing, offers, newsletters from any company
+3. "irrelevant" - OTP, login alerts, account statements, non-financial
 
-Return ONLY valid JSON or null:
-{{"amount": 1234.56, "merchant": "name or VPA", "vpa": "vpa@bank or empty", "mode": "UPI/Credit Card/NACH/Debit Card/Net Banking", "is_debit": true}}"""
+If bank_transaction AND it's a DEBIT (money going out), also extract:
+- bank: bank name
+- amount: number only
+- mode: UPI / Credit Card / Debit Card / NACH / Net Banking
+- merchant: merchant name or VPA handle
+- vpa: UPI VPA if available
+
+Respond ONLY as JSON:
+{{"type": "bank_transaction", "is_debit": true, "bank": "HDFC", "amount": 1234.56, "mode": "UPI", "merchant": "Zomato", "vpa": "zomato@icici"}}
+OR
+{{"type": "promotional", "reason": "marketing email from Zomato"}}
+OR
+{{"type": "irrelevant", "reason": "OTP email"}}"""
 
     try:
         resp = requests.post(
@@ -292,100 +404,122 @@ Return ONLY valid JSON or null:
             },
             json={
                 "model": "claude-haiku-4-5-20251001",
-                "max_tokens": 200,
+                "max_tokens": 300,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=10
+        )
+        resp.raise_for_status()
+        text = resp.json()["content"][0]["text"].strip()
+        # Extract JSON
+        m = re.search(r'\{.*\}', text, re.DOTALL)
+        if m:
+            return json.loads(m.group(0))
+    except Exception as e:
+        print(f"AI classify error: {str(e)[:100]}")
+    return {"type": "irrelevant"}
+
+def ai_classify_merchant(merchant_raw: str, vpa: str, amount: float) -> tuple:
+    """AI classifies unknown merchant. Returns (canonical, category, treatment)."""
+    if not ANTHROPIC_API_KEY:
+        return merchant_raw, "Other", "spend"
+
+    prompt = f"""Classify this Indian payment transaction merchant.
+
+Merchant/VPA: "{merchant_raw or vpa}"
+Amount: ₹{amount}
+
+Return ONLY JSON:
+{{"canonical": "Clean merchant name", "category": "category name", "treatment": "spend or investment or settlement"}}
+
+Categories: Food & Dining, Groceries, Shopping, Travel & Transport, Fuel, Entertainment & OTT, Health & Medical, Utilities & Bills, Subscriptions, Education, Rent, P2P Transfer, Daily Spend, Insurance, EMI & Loans, Credit Card Payment, Investments & Finance, Other
+Treatment: spend (regular purchase), investment (SIP/MF/stocks), settlement (CC payment/EMI)"""
+
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 150,
                 "messages": [{"role": "user", "content": prompt}],
             },
             timeout=8
         )
         resp.raise_for_status()
         text = resp.json()["content"][0]["text"].strip()
-        text = re.sub(r'```json|```', '', text).strip()
-        if 'null' in text.lower() and '{' not in text:
-            return None
-        # Extract just the JSON object
-        m = re.search(r'\{[^}]+\}', text, re.DOTALL)
-        if not m:
-            return None
-        data = json.loads(m.group(0))
-        if not data.get("is_debit") or not data.get("amount"):
-            return None
-        return data
+        m = re.search(r'\{.*\}', text, re.DOTALL)
+        if m:
+            data = json.loads(m.group(0))
+            canonical = data.get("canonical", merchant_raw)
+            category = data.get("category", "Other")
+            treatment = data.get("treatment", "spend")
+            # Save new VPA rule if we have a VPA
+            if vpa and canonical and category != "Other":
+                handle = vpa.split("@")[0].lower()
+                save_vpa_rule(handle, canonical, category, treatment)
+            return canonical, category, treatment
     except Exception as e:
-        print(f"AI extraction error: {str(e)[:100]}")
-        return None
+        print(f"AI merchant error: {str(e)[:100]}")
+    return merchant_raw or "Unknown", "Other", "spend"
 
-# ── Learned senders ───────────────────────────────────────────
-
-def ensure_learned_senders_table():
+def save_vpa_rule(keyword: str, merchant: str, category: str, treatment: str):
+    """Save newly learned VPA rule to DB."""
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    CREATE TABLE IF NOT EXISTS learned_senders (
-                        id SERIAL PRIMARY KEY,
-                        sender_email VARCHAR(255) UNIQUE NOT NULL,
-                        bank_name VARCHAR(100) NOT NULL,
-                        is_active BOOLEAN DEFAULT TRUE,
-                        discovered_at TIMESTAMPTZ DEFAULT NOW()
-                    )
-                """)
+                    INSERT INTO vpa_rules (keyword, merchant_canonical, category, treatment, source)
+                    VALUES (%s, %s, %s, %s, 'ai') ON CONFLICT (keyword) DO NOTHING
+                """, (keyword.lower(), merchant, category, treatment))
                 conn.commit()
-    except:
-        pass
-
-def get_learned_senders() -> dict:
-    try:
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT sender_email, bank_name FROM learned_senders WHERE is_active = TRUE")
-                return {row[0]: row[1] for row in cur.fetchall()}
-    except:
-        return {}
-
-def save_learned_sender(sender_email: str, bank_name: str):
-    try:
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO learned_senders (sender_email, bank_name)
-                    VALUES (%s, %s) ON CONFLICT (sender_email) DO NOTHING
-                """, (sender_email, bank_name))
-                conn.commit()
-        print(f"Learned sender: {sender_email} → {bank_name}")
+        print(f"New VPA rule learned: {keyword} → {merchant} ({category})")
     except:
         pass
 
 # ── Main sync ─────────────────────────────────────────────────
 
 def sync_gmail_account(user_id: str, gmail_email: str, access_token: str, refresh_token: str) -> tuple:
-    """Sync one Gmail account. Returns (new_transactions, banks_found)."""
-    
-    ensure_learned_senders_table()
-    ensure_rules_tables()
-    seed_rules_from_config()
+    """
+    Sync one Gmail account.
+    Steps:
+    1. Fetch ALL emails from known bank senders (DB) + broad financial keywords
+    2. Skip negative senders immediately
+    3. Known bank sender → rule-based extract → AI for unknowns
+    4. Unknown sender → AI classifies → save to bank_senders or negative_rules
+    5. Store transactions with full details
+    Returns (new_transactions_count, banks_found_set)
+    """
+    ensure_tables()
+    seed_bank_senders()
+    seed_vpa_nach_rules()
+
     last_sync = get_last_sync(user_id, gmail_email)
-    
     if last_sync:
         after = (last_sync - timedelta(days=2)).strftime("%Y/%m/%d")
     else:
         after = (datetime.now() - timedelta(days=90)).strftime("%Y/%m/%d")
-    
-    learned_senders = get_learned_senders()
-    all_senders = {**BANK_SENDERS, **learned_senders}
-    
-    # Build Gmail search queries
-    # Query 1: All known bank senders (fast, targeted)
-    sender_list = " OR ".join([f"from:{s}" for s in list(all_senders.keys())[:50]])
-    # Query 2: Broad debit/transaction keywords (catches unknown senders)
-    broad_query = f"(debited OR \"UPI transaction\" OR \"transaction alert\" OR \"spent on\") after:{after} -from:me"
-    
-    queries = [
-        f"({sender_list}) after:{after}",
-        broad_query,
-    ]
-    
+
+    # Load rules from DB
+    bank_senders = get_all_bank_senders()
+    negative_senders = get_negative_senders()
+    vpa_rules = get_vpa_rules()
+    nach_rules = get_nach_rules()
+
+    print(f"Sync start: {len(bank_senders)} bank senders, {len(negative_senders)} negative rules")
+
+    # Build search query — known senders + broad financial keywords
+    sender_list = " OR ".join([f"from:{s}" for s in list(bank_senders.keys())[:60]])
+    queries = [f"({sender_list}) after:{after}"] if sender_list else []
+    # Broad query for unknown senders with strong debit signals
+    queries.append(f"(\"has been debited\" OR \"has been used\" OR \"UPI transaction alert\" OR \"Credit Card transaction\") after:{after}")
+
     current_token = access_token
-    
+
     def safe_get(path, params=None):
         nonlocal current_token
         try:
@@ -396,13 +530,13 @@ def sync_gmail_account(user_id: str, gmail_email: str, access_token: str, refres
                 update_access_token(user_id, gmail_email, current_token)
                 return gmail_get(path, current_token, params)
             raise
-    
+
     transactions = []
     banks_found = set()
     emails_processed = 0
-    seen_msg_ids = set()
     ai_calls = 0
-    
+    seen_msg_ids = set()
+
     for query in queries:
         try:
             data = safe_get("messages", {"q": query, "maxResults": 200})
@@ -410,131 +544,175 @@ def sync_gmail_account(user_id: str, gmail_email: str, access_token: str, refres
                 if m['id'] in seen_msg_ids:
                     continue
                 seen_msg_ids.add(m['id'])
-                
+
                 try:
                     full = safe_get(f"messages/{m['id']}")
                     sender_raw = get_header(full, "From")
-                    sender_email = extract_sender_email(sender_raw)
+                    sender = extract_sender_email(sender_raw)
                     subject = get_header(full, "Subject")
                     body = get_body(full)
                     msg_id = get_header(full, "Message-ID") or m['id']
-                    
-                    # Step 1: Identify bank
-                    bank = identify_bank(sender_email, subject, body)
-                    
-                    # Step 2: If unknown sender, try AI bank identification (once per sender)
-                    if not bank and sender_email not in learned_senders:
-                        if ai_calls < 20:  # Limit AI calls per sync
-                            bank = ai_identify_bank(subject, body[:300], sender_email)
-                            ai_calls += 1
-                            if bank:
-                                save_learned_sender(sender_email, bank)
-                                learned_senders[sender_email] = bank
-                    
+                    text = subject + " " + body
+
+                    # STEP 1: Skip negative senders immediately
+                    if sender in negative_senders:
+                        emails_processed += 1
+                        continue
+
+                    # STEP 2: Identify bank
+                    bank = bank_senders.get(sender)
                     if not bank:
-                        emails_processed += 1
-                        continue
-                    
-                    banks_found.add(bank)
-                    
-                    # Step 3: Rule-based extraction first
-                    extracted = rule_based_extract(subject, body, bank)
-                    
-                    # Step 4: AI extraction only if rule-based fails
-                    if not extracted and ai_calls < 50:
-                        ai_data = ai_extract_transaction(subject, body, bank)
+                        # Partial match
+                        for known, bname in bank_senders.items():
+                            if known in sender:
+                                bank = bname
+                                break
+
+                    # STEP 3: Unknown sender → AI classifies
+                    if not bank and ai_calls < 30:
+                        result = ai_classify_email(subject, body[:800], sender)
                         ai_calls += 1
-                        if ai_data:
-                            extracted = {
-                                "amount": float(ai_data["amount"]),
-                                "mode": ai_data.get("mode", "Unknown"),
-                                "vpa": ai_data.get("vpa", ""),
-                                "merchant_raw": ai_data.get("merchant", ""),
-                                "merchant_canonical": None,
-                                "category": "Other",
-                                "treatment": "spend",
-                                "person_name": "",
-                                "needs_ai": True,
-                            }
-                    
-                    if not extracted:
+
+                        if result.get("type") == "promotional":
+                            save_negative_rule(sender, result.get("reason", "promotional"), "ai")
+                            negative_senders.add(sender)
+                            emails_processed += 1
+                            continue
+                        elif result.get("type") == "irrelevant":
+                            save_negative_rule(sender, result.get("reason", "irrelevant"), "ai")
+                            negative_senders.add(sender)
+                            emails_processed += 1
+                            continue
+                        elif result.get("type") == "bank_transaction":
+                            bank = result.get("bank", "Unknown Bank")
+                            save_bank_sender(sender, bank, "ai")
+                            bank_senders[sender] = bank
+                            # Use AI-extracted transaction data directly
+                            if result.get("is_debit") and result.get("amount"):
+                                amount = float(result["amount"])
+                                merchant_raw = clean_merchant(result.get("merchant", ""))
+                                vpa = result.get("vpa", "")
+                                mode = result.get("mode", "Unknown")
+
+                                # Resolve merchant
+                                resolved = resolve_vpa(vpa, amount, vpa_rules) if vpa else None
+                                if resolved:
+                                    canonical, category, treatment, person_name = resolved
+                                    ai_cls = False
+                                else:
+                                    canonical, category, treatment = ai_classify_merchant(merchant_raw, vpa, amount)
+                                    person_name = ""
+                                    ai_cls = True
+                                    ai_calls += 1
+
+                                transactions.append({
+                                    "bank": bank, "mode": mode, "amount": amount,
+                                    "merchant_raw": merchant_raw, "merchant_canonical": canonical,
+                                    "category": category, "treatment": treatment,
+                                    "vpa": vpa, "person_name": person_name,
+                                    "date": parse_email_date(full),
+                                    "msg_id": msg_id, "gmail_account": gmail_email,
+                                    "ai_classified": ai_cls,
+                                })
+                                banks_found.add(bank)
                         emails_processed += 1
                         continue
-                    
-                    amount = extracted["amount"]
-                    merchant_raw = extracted.get("merchant_raw", "")
-                    vpa = extracted.get("vpa", "")
-                    
-                    # Step 5: Resolve merchant (rule-based first, AI if needed)
-                    if extracted.get("merchant_canonical"):
-                        # Already resolved by rule-based
-                        canonical = extracted["merchant_canonical"]
-                        category = extracted["category"]
-                        treatment = extracted["treatment"]
-                        person_name = extracted.get("person_name", "")
-                        ai_cls = False
-                    else:
-                        # Use merchant_resolver (handles DB lookup + AI)
-                        canonical, category, treatment, person_name, ai_cls = resolve_merchant(
-                            merchant_raw, vpa, amount
-                        )
-                        if ai_cls:
+
+                    # STEP 4: Known bank sender → check if debit
+                    if not is_debit(subject, body):
+                        emails_processed += 1
+                        continue
+
+                    banks_found.add(bank)
+                    amount = extract_amount(text)
+                    if not amount:
+                        emails_processed += 1
+                        continue
+
+                    mode = detect_mode(text)
+                    merchant_raw = ""
+                    vpa = ""
+                    canonical = "Unknown"
+                    category = "Other"
+                    treatment = "spend"
+                    person_name = ""
+                    ai_cls = False
+
+                    # STEP 5: Extract merchant by mode
+                    if mode == "UPI":
+                        vpa = extract_vpa(text)
+                        resolved = resolve_vpa(vpa, amount, vpa_rules) if vpa else None
+                        if resolved:
+                            canonical, category, treatment, person_name = resolved
+                            merchant_raw = vpa
+                        else:
+                            merchant_raw = vpa
+                            # AI classifies unknown VPA
+                            if ai_calls < 50:
+                                canonical, category, treatment = ai_classify_merchant(merchant_raw, vpa, amount)
+                                ai_cls = True
+                                ai_calls += 1
+
+                    elif mode == "Credit Card":
+                        # Multiple patterns for different bank formats
+                        cc_patterns = [
+                            r'payment to\s+([A-Z0-9][A-Za-z0-9\s\*\-\.]+?)\s+on\s+\d',
+                            r'used for.*?(?:payment to|at)\s+([A-Z0-9][A-Za-z0-9\s\*\-\.]+?)\s+on\s+\d',
+                            r'INR\s+[\d,\.]+\s+for\s+(?:payment to\s+)?([A-Z][A-Za-z0-9\s\*\-\.]+?)\s+on\s+\d',
+                            r'(?:at|towards)\s+([A-Z][A-Za-z0-9\s\*\-\.]+?)\s+(?:on|for|dated|\d)',
+                        ]
+                        for pattern in cc_patterns:
+                            mm = re.search(pattern, text, re.IGNORECASE)
+                            if mm:
+                                merchant_raw = clean_merchant(mm.group(1).strip())
+                                break
+                        if merchant_raw and ai_calls < 50:
+                            canonical, category, treatment = ai_classify_merchant(merchant_raw, "", amount)
+                            ai_cls = True
                             ai_calls += 1
-                    
+
+                    elif mode == "NACH":
+                        merchant_raw, category, treatment = resolve_nach(body, nach_rules)
+                        canonical = merchant_raw
+
+                    else:
+                        # Net Banking / Debit Card
+                        mm = re.search(r'(?:at|to)\s+([A-Z][A-Za-z0-9\s\-\.]+?)\s+(?:on|\d)', text, re.IGNORECASE)
+                        if mm:
+                            merchant_raw = clean_merchant(mm.group(1).strip())
+                        if merchant_raw and ai_calls < 50:
+                            canonical, category, treatment = ai_classify_merchant(merchant_raw, "", amount)
+                            ai_cls = True
+                            ai_calls += 1
+
                     transactions.append({
-                        "bank": bank,
-                        "mode": extracted["mode"],
-                        "amount": amount,
-                        "merchant_raw": merchant_raw or vpa,
-                        "merchant_canonical": canonical,
-                        "category": category,
-                        "treatment": treatment,
-                        "vpa": vpa,
-                        "person_name": person_name,
+                        "bank": bank, "mode": mode, "amount": amount,
+                        "merchant_raw": merchant_raw, "merchant_canonical": canonical or merchant_raw,
+                        "category": category, "treatment": treatment,
+                        "vpa": vpa, "person_name": person_name,
                         "date": parse_email_date(full),
-                        "msg_id": msg_id,
-                        "gmail_account": gmail_email,
+                        "msg_id": msg_id, "gmail_account": gmail_email,
                         "ai_classified": ai_cls,
                     })
                     emails_processed += 1
-                    
+
                 except Exception as e:
-                    print(f"Email processing error: {str(e)[:100]}")
+                    print(f"Email error: {str(e)[:80]}")
                     emails_processed += 1
                     continue
-                    
+
         except Exception as e:
-            print(f"Query error: {str(e)[:100]}")
+            print(f"Query error: {str(e)[:80]}")
             continue
-    
+
     print(f"Sync done: {emails_processed} emails, {len(transactions)} transactions, {ai_calls} AI calls")
-    
+
     if transactions:
         save_transactions(user_id, transactions)
-    
+
     update_sync_log(user_id, gmail_email, emails_processed, len(transactions))
     return len(transactions), banks_found
 
-def ai_identify_bank(subject: str, body: str, sender: str) -> str:
-    """AI bank identification — only for unknown senders."""
-    if not ANTHROPIC_API_KEY:
-        return None
-    try:
-        resp = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={
-                "model": "claude-haiku-4-5-20251001",
-                "max_tokens": 20,
-                "messages": [{"role": "user", "content": f"Is this a bank transaction alert email? From: {sender}\nSubject: {subject}\nBody: {body}\n\nReturn ONLY bank name (HDFC/ICICI/SBI/Axis/Kotak/HSBC/etc) or null"}],
-            },
-            timeout=5
-        )
-        resp.raise_for_status()
-        text = resp.json()["content"][0]["text"].strip()
-        return None if text.lower() == "null" else text
-    except:
-        return None
 
 def sync_all_gmail(user_id: str, gmail_accounts: list) -> dict:
     total_new = 0
@@ -548,11 +726,13 @@ def sync_all_gmail(user_id: str, gmail_accounts: list) -> dict:
             total_new += new_txns
             all_banks.update(banks)
         except Exception as e:
-            print(f"Sync error for {account.get('email','?')}: {str(e)[:100]}")
+            print(f"Account sync error {account.get('email','?')}: {str(e)[:100]}")
     return {"new_transactions": total_new, "banks_found": list(all_banks)}
+
 
 def get_transactions(user_id: str, gmail_accounts: list, days: int = 30,
                      start_date=None, end_date=None) -> list:
+    """Sync then return from DB."""
     sync_all_gmail(user_id, gmail_accounts)
     from db import get_transactions_from_db
     return get_transactions_from_db(user_id, days=days, start_date=start_date, end_date=end_date)
