@@ -1,18 +1,22 @@
 """
-Gmail Reader v2 — incremental sync, 15 banks, 2-day buffer
+Gmail Reader v3 — Smart approach
+- Broad search for ANY bank transaction email
+- AI filters and extracts transaction details
+- Learns sender addresses automatically
+- No hardcoded sender list needed
 """
-import base64, re, os, requests
+import base64, re, os, requests, json
 from datetime import datetime, timedelta
-from db import get_last_sync, update_sync_log, save_transactions, update_access_token
-from merchant_resolver import resolve_merchant
+from db import get_last_sync, update_sync_log, save_transactions, update_access_token, get_conn
 from security import sanitise_log
 
 GMAIL_API = "https://gmail.googleapis.com/gmail/v1/users/me"
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 
-# Bank sender map
-BANK_SENDERS = {
+# ── Known senders (fast lookup, grows automatically) ──────────
+KNOWN_SENDERS = {
     "alerts@hdfcbank.net":          "HDFC",
     "nachautoemailer@hdfcbank.net": "HDFC",
     "alerts@icicibank.com":         "ICICI",
@@ -24,6 +28,7 @@ BANK_SENDERS = {
     "alerts@idfcfirstbank.com":     "IDFC First",
     "alerts@indusind.com":          "IndusInd",
     "hsbc@hsbc.co.in":              "HSBC",
+    "hsbc@mail.hsbc.co.in":         "HSBC",
     "hsbc@mandatehq.com":           "HSBC",
     "alerts@federalbank.co.in":     "Federal Bank",
     "alerts@pnb.co.in":             "PNB",
@@ -31,6 +36,8 @@ BANK_SENDERS = {
     "alerts@rblbank.com":           "RBL",
     "alerts@canarabank.in":         "Canara Bank",
 }
+
+# ── Gmail helpers ──────────────────────────────────────────────
 
 def refresh_access_token(refresh_token: str) -> str:
     resp = requests.post("https://oauth2.googleapis.com/token", data={
@@ -40,14 +47,14 @@ def refresh_access_token(refresh_token: str) -> str:
         "grant_type": "refresh_token",
     })
     resp.raise_for_status()
-    data = resp.json()
-    return data["access_token"]
+    return resp.json()["access_token"]
 
 def gmail_get(path, access_token, params=None):
     resp = requests.get(
         f"{GMAIL_API}/{path}",
         headers={"Authorization": f"Bearer {access_token}"},
         params=params or {},
+        timeout=15
     )
     if resp.status_code in [401, 403]:
         raise requests.HTTPError(response=resp)
@@ -78,187 +85,199 @@ def get_body(msg):
         body = decode_body(payload["body"]["data"])
     elif payload.get("parts"):
         body = walk(payload["parts"])
-    return body + " " + msg.get("snippet", "")
+    # Combine body + snippet for best coverage
+    return (body + " " + msg.get("snippet", ""))[:2000]
 
-def parse_amount(text):
-    m = re.search(r"(?:Rs\.?|INR|₹)\s*([\d,]+\.?\d*)", text, re.IGNORECASE)
-    return float(m.group(1).replace(",", "")) if m else None
-
-def parse_date(msg):
+def parse_date_from_msg(msg):
     date_str = get_header(msg, "Date")
-    for fmt in ["%a, %d %b %Y %H:%M:%S %z", "%d %b %Y %H:%M:%S %z", "%a, %d %b %Y %H:%M:%S %Z"]:
+    for fmt in ["%a, %d %b %Y %H:%M:%S %z", "%d %b %Y %H:%M:%S %z",
+                "%a, %d %b %Y %H:%M:%S %Z", "%d %b %Y %H:%M:%S %Z"]:
         try:
             return datetime.strptime(date_str[:35].strip(), fmt).date()
         except:
             pass
     return datetime.now().date()
 
-def parse_with_ai(msg, bank: str, gmail_account: str) -> dict:
-    """AI-based parsing for banks without specific rules."""
-    from merchant_resolver import ANTHROPIC_API_KEY
+def extract_sender_email(from_header: str) -> str:
+    """Extract clean email from From header like 'HDFC Bank <alerts@hdfcbank.net>'"""
+    m = re.search(r'<([^>]+)>', from_header)
+    if m:
+        return m.group(1).lower().strip()
+    return from_header.lower().strip()
+
+# ── Learned senders DB ─────────────────────────────────────────
+
+def get_learned_senders() -> dict:
+    """Load sender addresses learned from previous syncs."""
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT sender_email, bank_name FROM learned_senders
+                    WHERE is_active = TRUE
+                """)
+                return {row[0]: row[1] for row in cur.fetchall()}
+    except:
+        return {}
+
+def save_learned_sender(sender_email: str, bank_name: str):
+    """Save a newly discovered bank sender."""
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS learned_senders (
+                        id SERIAL PRIMARY KEY,
+                        sender_email VARCHAR(255) UNIQUE NOT NULL,
+                        bank_name VARCHAR(100) NOT NULL,
+                        is_active BOOLEAN DEFAULT TRUE,
+                        discovered_at TIMESTAMPTZ DEFAULT NOW()
+                    )
+                """)
+                cur.execute("""
+                    INSERT INTO learned_senders (sender_email, bank_name)
+                    VALUES (%s, %s)
+                    ON CONFLICT (sender_email) DO NOTHING
+                """, (sender_email, bank_name))
+                conn.commit()
+    except:
+        pass
+
+def identify_bank(sender_email: str, learned: dict) -> str:
+    """Identify bank from sender — checks hardcoded + learned senders."""
+    # Check known senders
+    for known_sender, bank in KNOWN_SENDERS.items():
+        if known_sender in sender_email or sender_email in known_sender:
+            return bank
+    # Check learned senders
+    if sender_email in learned:
+        return learned[sender_email]
+    return None
+
+# ── AI extraction ──────────────────────────────────────────────
+
+def ai_extract_transaction(subject: str, body: str, sender: str, bank: str) -> dict:
+    """
+    Use Claude Haiku to extract transaction from email.
+    Returns dict or None if not a debit transaction.
+    """
     if not ANTHROPIC_API_KEY:
         return None
 
-    body = get_body(msg)[:1500]
-    subject = get_header(msg, "Subject")
+    prompt = f"""Extract transaction details from this bank alert email.
 
-    prompt = f"""Extract transaction details from this {bank} bank alert email.
-
+Bank: {bank}
+From: {sender}
 Subject: {subject}
-Body: {body}
-
-Return ONLY valid JSON or null if not a debit transaction:
-{{"amount": 1234.56, "merchant": "merchant name", "vpa": "vpa@bank or empty", "mode": "UPI/Credit Card/NACH/Debit Card", "is_debit": true}}
+Body: {body[:1500]}
 
 Rules:
-- Only extract DEBIT transactions (money going OUT)
-- Return null for credit, refund, balance alerts, OTP emails
-- Amount must be a number, not null"""
+- Only extract DEBIT transactions (money going OUT from account)
+- Skip: credit/refund/OTP/login/balance/statement/welcome emails
+- For UPI: extract the VPA (like name@upi or phone@paytm)
+- For credit card: extract merchant name
+- Amount must be a positive number
+
+Return ONLY valid JSON or the word null:
+{{"amount": 1234.56, "merchant": "merchant or person name", "vpa": "upi@handle or empty string", "mode": "UPI/Credit Card/NACH/Debit Card/Net Banking", "is_debit": true}}"""
 
     try:
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
-            headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={"model": "claude-haiku-4-5-20251001", "max_tokens": 200,
-                  "messages": [{"role": "user", "content": prompt}]},
-            timeout=5
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 200,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=8
         )
         resp.raise_for_status()
-        import json
         text = resp.json()["content"][0]["text"].strip()
         text = re.sub(r'```json|```', '', text).strip()
-        if text.lower() == 'null':
+        if text.lower() == 'null' or not text:
             return None
         data = json.loads(text)
         if not data.get("is_debit") or not data.get("amount"):
             return None
+        return data
+    except Exception as e:
+        print(f"AI extraction error: {str(e)[:100]}")
+        return None
 
-        merchant = data.get("merchant", "")
-        vpa = data.get("vpa", "")
-        amount = float(data["amount"])
-        canonical, category, treatment, person_name, ai_cls = resolve_merchant(merchant, vpa, amount)
+def ai_identify_bank_sender(subject: str, body: str, sender: str) -> str:
+    """Use AI to identify if this is a bank transaction email and which bank."""
+    if not ANTHROPIC_API_KEY:
+        return None
 
-        return {
-            "bank": bank, "mode": data.get("mode", "Unknown"),
-            "amount": amount, "merchant_raw": merchant,
-            "merchant_canonical": canonical, "category": category,
-            "treatment": treatment, "vpa": vpa, "person_name": person_name,
-            "date": parse_date(msg),
-            "msg_id": get_header(msg, "Message-ID") or msg.get("id", ""),
-            "gmail_account": gmail_account, "ai_classified": ai_cls,
-        }
+    prompt = f"""Is this a bank transaction alert email from an Indian bank?
+
+From: {sender}
+Subject: {subject}
+Snippet: {body[:300]}
+
+If yes, return ONLY the bank name (e.g. "HDFC", "ICICI", "SBI", "Axis", "Kotak", "Yes Bank", "HSBC", "IDFC First", "IndusInd", "Federal Bank", "PNB", "Bank of Baroda", "RBL", "Canara Bank").
+If no, return ONLY the word "null"."""
+
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 20,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=5
+        )
+        resp.raise_for_status()
+        text = resp.json()["content"][0]["text"].strip()
+        if text.lower() == 'null' or not text:
+            return None
+        return text
     except:
         return None
 
-def parse_hdfc(msg, gmail_account: str) -> dict:
-    subject = get_header(msg, "Subject").lower()
-    sender = get_header(msg, "From").lower()
-    body = get_body(msg)
-    amount = parse_amount(subject + " " + body)
-    merchant, mode, vpa = "", "", ""
+# ── Main sync ──────────────────────────────────────────────────
 
-    # Credit card payment — settlement, exclude from spend
-    if "credit card" in subject and ("payment" in subject or "paid" in subject):
-        return {"bank": "HDFC", "mode": "Credit Card Payment", "amount": amount or 0,
-                "merchant_raw": "HDFC Credit Card", "merchant_canonical": "HDFC Credit Card",
-                "category": "Credit Card Payment", "treatment": "settlement",
-                "vpa": "", "person_name": "", "date": parse_date(msg),
-                "msg_id": get_header(msg, "Message-ID") or msg.get("id", ""),
-                "gmail_account": gmail_account, "ai_classified": False}
-
-    if "upi" in subject:
-        mode = "UPI"
-        m = re.search(r"VPA\s+([\w.\-@]+)\s+on", body, re.IGNORECASE)
-        if m: vpa = m.group(1)
-        m2 = re.search(r"to\s+(.+?)\s+(?:on|via|from)", body, re.IGNORECASE)
-        if m2: merchant = m2.group(1).strip()
-        if "debited" not in body.lower() and "debit" not in subject: return None
-    elif "credit card" in subject and "used" in body.lower():
-        mode = "Credit Card"
-        m = re.search(r"(?:at|towards)\s+(.+?)\s+(?:on|for)\s+\d", body, re.IGNORECASE)
-        if m: merchant = m.group(1).strip()
-    elif "nach" in body.lower() or "nachautoemailer" in sender:
-        mode = "NACH"
-        m = re.search(r"towards\s+(.+?)\s+with UMRN", body, re.IGNORECASE)
-        if m: merchant = m.group(1).strip()
-    elif "reversal" in subject:
-        mode = "Reversal"
-        return None  # Refunds — skip for now
-    else:
-        return None
-
-    if not amount: return None
-
-    canonical, category, treatment, person_name, ai_cls = resolve_merchant(merchant, vpa, amount)
-    return {
-        "bank": "HDFC", "mode": mode, "amount": amount,
-        "merchant_raw": merchant, "merchant_canonical": canonical,
-        "category": category, "treatment": treatment,
-        "vpa": vpa, "person_name": person_name,
-        "date": parse_date(msg),
-        "msg_id": get_header(msg, "Message-ID") or msg.get("id", ""),
-        "gmail_account": gmail_account, "ai_classified": ai_cls,
-    }
-
-def parse_hsbc(msg, gmail_account: str) -> dict:
-    subject = get_header(msg, "Subject").lower()
-    sender = get_header(msg, "From").lower()
-    body = get_body(msg)
-    amount = parse_amount(body)
-    merchant, mode = "", ""
-
-    if "purchase" in subject or "used" in body.lower():
-        mode = "Credit Card"
-        m = re.search(r"payment to\s+(.+?)\s+on\s+\d", body, re.IGNORECASE)
-        if m: merchant = m.group(1).strip()
-        if "used" not in body.lower(): return None
-    elif "mandatehq" in sender:
-        mode = "e-Mandate"
-        m = re.search(r"Merchant\s+(.+?)[\n\r]", body)
-        if m: merchant = m.group(1).strip()
-    elif "credit card" in subject and "payment" in subject:
-        return {"bank": "HSBC", "mode": "Credit Card Payment", "amount": amount or 0,
-                "merchant_raw": "HSBC Credit Card", "merchant_canonical": "HSBC Credit Card",
-                "category": "Credit Card Payment", "treatment": "settlement",
-                "vpa": "", "person_name": "", "date": parse_date(msg),
-                "msg_id": get_header(msg, "Message-ID") or msg.get("id", ""),
-                "gmail_account": gmail_account, "ai_classified": False}
-    else:
-        return None
-
-    if not amount: return None
-
-    canonical, category, treatment, person_name, ai_cls = resolve_merchant(merchant, "", amount)
-    return {
-        "bank": "HSBC", "mode": mode, "amount": amount,
-        "merchant_raw": merchant, "merchant_canonical": canonical,
-        "category": category, "treatment": treatment,
-        "vpa": "", "person_name": person_name,
-        "date": parse_date(msg),
-        "msg_id": get_header(msg, "Message-ID") or msg.get("id", ""),
-        "gmail_account": gmail_account, "ai_classified": ai_cls,
-    }
-
-def sync_gmail_account(user_id: str, gmail_account: str, access_token: str, refresh_token: str) -> tuple:
+def sync_gmail_account(user_id: str, gmail_email: str, access_token: str, refresh_token: str) -> tuple:
     """
-    Sync one Gmail account. Returns (new_transactions, banks_found).
-    Uses 2-day buffer before last sync to catch missed emails.
+    Smart sync for one Gmail account.
+    Returns (new_transactions_count, banks_found_set)
     """
-    last_sync = get_last_sync(user_id, gmail_account)
+    last_sync = get_last_sync(user_id, gmail_email)
 
     if last_sync:
-        # 2-day buffer before last sync to catch gaps
+        # 2-day buffer to catch missed emails
         after = (last_sync - timedelta(days=2)).strftime("%Y/%m/%d")
     else:
+        # First sync — go back 90 days
         after = (datetime.now() - timedelta(days=90)).strftime("%Y/%m/%d")
 
-    # Build queries for all known bank senders
-    queries = [f"from:{sender} after:{after}" for sender in BANK_SENDERS.keys()]
+    # Load learned senders
+    learned_senders = get_learned_senders()
+    all_senders = {**KNOWN_SENDERS, **learned_senders}
+
+    # Build search queries
+    # Query 1: Known sender addresses (fast, cheap)
+    known_sender_query = " OR ".join([f"from:{s}" for s in all_senders.keys()])
+    # Query 2: Broad transaction keyword search (catches unknown senders)
+    broad_query = f"(debited OR \"UPI transaction\" OR \"credit card\" OR \"spent\" OR \"transaction alert\") after:{after}"
+
+    queries = [
+        f"({known_sender_query}) after:{after}",
+        broad_query,
+    ]
 
     current_token = access_token
-    transactions = []
-    banks_found = set()
-    emails_processed = 0
 
     def safe_get(path, params=None):
         nonlocal current_token
@@ -266,56 +285,101 @@ def sync_gmail_account(user_id: str, gmail_account: str, access_token: str, refr
             return gmail_get(path, current_token, params)
         except requests.HTTPError as e:
             if e.response.status_code in [401, 403]:
-                # Rotate token
                 current_token = refresh_access_token(refresh_token)
-                update_access_token(user_id, gmail_account, current_token)
+                update_access_token(user_id, gmail_email, current_token)
                 return gmail_get(path, current_token, params)
             raise
+
+    transactions = []
+    banks_found = set()
+    emails_processed = 0
+    seen_msg_ids = set()
 
     for query in queries:
         try:
             data = safe_get("messages", {"q": query, "maxResults": 200})
-            for m in data.get("messages", []):
+            messages = data.get("messages", [])
+
+            for m in messages:
+                if m['id'] in seen_msg_ids:
+                    continue
+                seen_msg_ids.add(m['id'])
+
                 try:
                     full = safe_get(f"messages/{m['id']}")
-                    sender_raw = get_header(full, "From").lower()
+                    sender_raw = get_header(full, "From")
+                    sender_email = extract_sender_email(sender_raw)
+                    subject = get_header(full, "Subject")
+                    body = get_body(full)
+                    msg_id = get_header(full, "Message-ID") or m['id']
 
-                    # Identify bank
-                    bank = None
-                    for sender_key, bank_name in BANK_SENDERS.items():
-                        if sender_key in sender_raw:
-                            bank = bank_name
-                            break
+                    # Step 1: Try to identify bank from known/learned senders
+                    bank = identify_bank(sender_email, learned_senders)
+
+                    # Step 2: If unknown sender, use AI to identify bank
+                    if not bank:
+                        bank = ai_identify_bank_sender(subject, body, sender_email)
+                        if bank:
+                            # Save this sender for future fast lookups
+                            save_learned_sender(sender_email, bank)
+                            learned_senders[sender_email] = bank
+                            print(f"Learned new sender: {sender_email} → {bank}")
 
                     if not bank:
+                        emails_processed += 1
                         continue
 
                     banks_found.add(bank)
 
-                    # Parse by bank
-                    parsed = None
-                    if bank == "HDFC":
-                        parsed = parse_hdfc(full, gmail_account)
-                    elif bank == "HSBC":
-                        parsed = parse_hsbc(full, gmail_account)
-                    else:
-                        # AI parsing for all other banks
-                        parsed = parse_with_ai(full, bank, gmail_account)
+                    # Step 3: Extract transaction with AI
+                    extracted = ai_extract_transaction(subject, body, sender_email, bank)
+                    if not extracted:
+                        emails_processed += 1
+                        continue
 
-                    if parsed and parsed.get("amount", 0) > 0:
-                        transactions.append(parsed)
+                    amount = float(extracted["amount"])
+                    merchant_raw = extracted.get("merchant", "")
+                    vpa = extracted.get("vpa", "")
+                    mode = extracted.get("mode", "Unknown")
 
+                    # Step 4: Resolve merchant
+                    from merchant_resolver import resolve_merchant
+                    canonical, category, treatment, person_name, ai_cls = resolve_merchant(
+                        merchant_raw, vpa, amount
+                    )
+
+                    transactions.append({
+                        "bank": bank,
+                        "mode": mode,
+                        "amount": amount,
+                        "merchant_raw": merchant_raw,
+                        "merchant_canonical": canonical,
+                        "category": category,
+                        "treatment": treatment,
+                        "vpa": vpa,
+                        "person_name": person_name,
+                        "date": parse_date_from_msg(full),
+                        "msg_id": msg_id,
+                        "gmail_account": gmail_email,
+                        "ai_classified": ai_cls,
+                    })
                     emails_processed += 1
-                except:
+
+                except Exception as e:
+                    print(f"Error processing email: {str(e)[:100]}")
+                    emails_processed += 1
                     continue
-        except:
+
+        except Exception as e:
+            print(f"Query error: {str(e)[:100]}")
             continue
 
     if transactions:
         save_transactions(user_id, transactions)
 
-    update_sync_log(user_id, gmail_account, emails_processed, len(transactions))
+    update_sync_log(user_id, gmail_email, emails_processed, len(transactions))
     return len(transactions), banks_found
+
 
 def sync_all_gmail(user_id: str, gmail_accounts: list) -> dict:
     """Sync all Gmail accounts for a user."""
@@ -333,9 +397,11 @@ def sync_all_gmail(user_id: str, gmail_accounts: list) -> dict:
             total_new += new_txns
             all_banks.update(banks)
         except Exception as e:
-            pass  # Continue with other accounts
+            print(f"Sync error for {account.get('email', '?')}: {str(e)[:100]}")
+            continue
 
     return {"new_transactions": total_new, "banks_found": list(all_banks)}
+
 
 def get_transactions(user_id: str, gmail_accounts: list, days: int = 30,
                      start_date=None, end_date=None) -> list:
