@@ -15,29 +15,29 @@ from admin import is_admin, handle_admin_command
 BACKEND_URL = os.environ.get("BACKEND_URL", "")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 
-CONSENT_TEXT = """👋 Welcome to *Hisaab* — your personal finance assistant\.
+CONSENT_TEXT = """👋 Welcome to *Hisaab* — your personal finance assistant.
 
 Here's what I do:
-• Read your bank alert emails \(HDFC, HSBC, ICICI, SBI & 11 more banks\)
+• Read your bank alert emails (HDFC, HSBC, ICICI, SBI & 11 more banks)
 • Categorise every transaction automatically
 • Answer your spending questions in plain language
 • Show weekly & monthly summaries
 
 *Your privacy:*
-🔒 Read\-only Gmail access — I only search bank alert emails
+🔒 Read-only Gmail access — I only search bank alert emails
 🇮🇳 Your data stays secure and encrypted
 🗑️ Type *DELETE MY DATA* anytime to remove everything
 📋 Type *my data* to see exactly what I've stored
 
-Type *I AGREE* to continue\."""
+Type *I AGREE* to continue."""
 
-AI_CONSENT_TEXT = """One more thing before we connect your Gmail\.
+AI_CONSENT_TEXT = """One more thing before we connect your Gmail.
 
-*AI Notice:* I use Claude AI to answer your questions\. Your transaction data \(amounts, merchant names, dates\) is sent to Anthropic's AI for analysis\.
+*AI Notice:* I use Claude AI to answer your questions. Your transaction data (amounts, merchant names, dates) is sent to Anthropic's AI for analysis.
 
-*What is NOT sent:* Your email content, subjects, or personal emails\.
+*What is NOT sent:* Your email content, subjects, or personal emails.
 
-Type *I AGREE TO AI* to continue, or *NO AI* to use basic analysis only\."""
+Type *I AGREE TO AI* to continue, or *NO AI* to use basic analysis only."""
 
 async def handle_message(user_id: str, message: str, platform: str = "telegram") -> tuple:
     """
@@ -47,7 +47,7 @@ async def handle_message(user_id: str, message: str, platform: str = "telegram")
 
     # Rate limiting
     if not check_rate_limit(user_id):
-        return "⏳ Slow down a little\! Max 10 messages per minute\.", None
+        return "⏳ Slow down a little! Max 10 messages per minute.", None
 
     # Admin commands
     if is_admin(user_id) and message.startswith("/"):
@@ -57,7 +57,7 @@ async def handle_message(user_id: str, message: str, platform: str = "telegram")
     # Delete data
     if message_lower in ["delete my data", "delete data"]:
         delete_user(user_id)
-        return "✅ All your data has been permanently deleted\. Send anything to start fresh\.", None
+        return "✅ All your data has been permanently deleted. Send anything to start fresh.", None
 
     # Get or create user
     user = get_user(user_id)
@@ -70,11 +70,11 @@ async def handle_message(user_id: str, message: str, platform: str = "telegram")
 
     # Session timeout check
     if user.get("onboarded") and not check_session_active(user.get("last_active")):
-        return "👋 Welcome back\! For your security, please confirm it's you\.\n\nType *yes it's me* to continue\.", None
+        return "👋 Welcome back! For your security, please confirm it's you.\n\nType *yes it's me* to continue.", None
 
     if message_lower == "yes it's me":
         update_last_active(user_id)
-        return "✅ Verified\! Welcome back\. What would you like to know?", None
+        return "✅ Verified! Welcome back. What would you like to know?", None
 
     # Step 1 — Main consent
     if not user.get("consent_given"):
@@ -88,17 +88,17 @@ async def handle_message(user_id: str, message: str, platform: str = "telegram")
         if message_lower == "i agree to ai":
             save_consent(user_id, ai_consent=True)
             auth_url = f"{BACKEND_URL}/auth/google?number={user_id}"
-            return f"""✅ Perfect\! Now connect your Gmail so I can read your bank alerts\.
+            return f"""✅ Perfect! Now connect your Gmail so I can read your bank alerts.
 
 👉 [Tap here to connect Gmail]({auth_url})
 
-*What I'll search for:* Emails from your bank \(HDFC, ICICI, SBI etc\.\) only\. Nothing else\.
+*What I'll search for:* Emails from your bank (HDFC, ICICI, SBI etc.) only. Nothing else.
 
-Come back here once done\!""", None
+Come back here once done!""", None
         elif message_lower == "no ai":
             save_consent(user_id, ai_consent=False)
             auth_url = f"{BACKEND_URL}/auth/google?number={user_id}"
-            return f"""✅ Understood\. I'll use basic analysis only\.
+            return f"""✅ Understood. I'll use basic analysis only.
 
 👉 [Tap here to connect Gmail]({auth_url})""", None
         return AI_CONSENT_TEXT, None
@@ -108,7 +108,7 @@ Come back here once done\!""", None
         auth_url = f"{BACKEND_URL}/auth/google?number={user_id}"
         accounts = get_gmail_accounts(user_id)
         if not accounts:
-            return f"""You haven't connected your Gmail yet\.
+            return f"""You haven't connected your Gmail yet.
 
 👉 [Tap here to connect Gmail]({auth_url})""", None
 
@@ -120,7 +120,7 @@ Come back here once done\!""", None
     if message_lower in ["hi", "hello", "hey", "/start", "start"]:
         name = user.get("name", "").split()[0] if user.get("name") else "there"
         accounts_info = "\n".join([f"  • {a['email']}" for a in gmail_accounts])
-        return f"""Hi {name}\! 👋 I'm Hisaab, your expense assistant\.
+        return f"""Hi {name}! 👋 I'm Hisaab, your expense assistant.
 
 *Connected Gmail:*
 {accounts_info}
@@ -149,11 +149,11 @@ What would you like to know?""", None
     if message_lower == "add gmail":
         accounts = get_gmail_accounts(user_id)
         if len(accounts) >= 3:
-            return "You've already connected 3 Gmail accounts \(maximum\)\.", None
+            return "You've already connected 3 Gmail accounts (maximum).", None
         auth_url = f"{BACKEND_URL}/auth/google?number={user_id}"
         return f"""👉 [Tap here to connect another Gmail]({auth_url})
 
-You can connect up to 3 Gmail accounts\. Currently connected: {len(accounts)}/3""", None
+You can connect up to 3 Gmail accounts. Currently connected: {len(accounts)}/3""", None
 
     # Time period callbacks handled in main.py
     # Natural language time period detection
@@ -192,7 +192,7 @@ async def handle_callback(user_id: str, callback_data: str) -> tuple:
     if callback_data == "period_custom":
         return "Please type your date range like:\n*from 1 Jan to 31 Jan*", None
 
-    return "Unknown option\.", None
+    return "Unknown option.", None
 
 async def do_sync(user_id: str, gmail_accounts: list) -> str:
     try:
@@ -200,21 +200,21 @@ async def do_sync(user_id: str, gmail_accounts: list) -> str:
         banks = ", ".join(result["banks_found"]) if result["banks_found"] else "none detected"
         new = result["new_transactions"]
 
-        reply = f"✅ *Sync complete\!*\n\nNew transactions: *{new}*\nBanks found: {banks}\n\n"
+        reply = f"✅ *Sync complete!*\n\nNew transactions: *{new}*\nBanks found: {banks}\n\n"
 
         if result["banks_found"]:
-            reply += "Type *summary* to see your spending\!"
+            reply += "Type *summary* to see your spending!"
         else:
-            reply += """⚠️ No bank emails found\. Possible reasons:
+            reply += """⚠️ No bank emails found. Possible reasons:
 
-1\. Bank alerts might be in *spam* — check and move to inbox
-2\. Bank alerts not enabled — enable in your net banking app
-3\. Connected wrong Gmail — type *add gmail* to add another account
-4\. Bank not yet supported — which bank do you use?"""
+1. Bank alerts might be in *spam* — check and move to inbox
+2. Bank alerts not enabled — enable in your net banking app
+3. Connected wrong Gmail — type *add gmail* to add another account
+4. Bank not yet supported — which bank do you use?"""
 
         return reply
     except Exception as e:
-        return f"Sync failed\. Please try again\."
+        return f"Sync failed. Please try again."
 
 async def show_my_data(user_id: str, gmail_accounts: list) -> str:
     stats = get_sync_stats(user_id)
@@ -231,13 +231,13 @@ async def show_my_data(user_id: str, gmail_accounts: list) -> str:
 *Transactions stored:* {stats['total_transactions']}
 *Date range:* {stats['date_from'] or 'N/A'} to {stats['date_to'] or 'N/A'}
 
-*Data retention:* Transactions kept for 12 months, chat history for 30 days\.
+*Data retention:* Transactions kept for 12 months, chat history for 30 days.
 
 *Your rights:*
 • Type *DELETE MY DATA* to permanently delete everything
 • All data is encrypted and stored securely
 
-*We ONLY read:* Emails from your bank's known sender addresses\. Nothing else\."""
+*We ONLY read:* Emails from your bank's known sender addresses. Nothing else."""
 
 async def generate_period_summary(user_id: str, gmail_accounts: list, start_date, end_date, label: str) -> str:
     try:
@@ -247,7 +247,7 @@ async def generate_period_summary(user_id: str, gmail_accounts: list, start_date
         transactions = get_transactions_from_db(user_id, start_date=start_date, end_date=end_date)
 
         if not transactions:
-            return f"No transactions found for *{label}*\.\n\nTry *sync* to fetch latest emails\."
+            return f"No transactions found for *{label}*.\n\nTry *sync* to fetch latest emails."
 
         spend_txns = [t for t in transactions if t.get("treatment") == "spend"]
         invest_txns = [t for t in transactions if t.get("treatment") == "investment"]

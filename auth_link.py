@@ -68,15 +68,15 @@ async def handle_google_callback(code: str, state: str) -> str:
         # Send Telegram confirmation
         accounts = get_gmail_accounts(user_id)
         account_count = len(accounts)
-        add_more = f"\n\nYou can connect up to 3 Gmail accounts\. Connected: {account_count}/3" if account_count < 3 else ""
+        add_more = f"\n\nYou can connect up to 3 Gmail accounts. Connected: {account_count}/3" if account_count < 3 else ""
 
         async with httpx.AsyncClient() as client:
             await client.post(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
                 json={
                     "chat_id": int(user_id),
-                    "text": f"✅ *Gmail connected\!*\n\nAccount: `{email}`\n\nI'll now read your bank alert emails from this account\. Type *summary* to see your spending\!{add_more}",
-                    "parse_mode": "MarkdownV2"
+                    "text": f"✅ *Gmail connected!*\n\nAccount: `{email}`\n\nI'll now read your bank alert emails from this account. Type *summary* to see your spending!{add_more}",
+                    "parse_mode": "Markdown"
                 }
             )
 

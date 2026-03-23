@@ -45,7 +45,7 @@ async def handle_admin_command(user_id: str, command: str) -> str:
         auto_approve_old_pending()
         merchants = get_pending_merchants(10)
         if not merchants:
-            return "✅ No pending merchants\."
+            return "✅ No pending merchants."
         lines = "\n".join([f"• `{m['canonical_name']}` → {m['category']}" for m in merchants])
         return f"⏳ *Pending merchants:*\n{lines}\n\nUse `/approve name` or `/reject name category`"
 
@@ -58,12 +58,12 @@ async def handle_admin_command(user_id: str, command: str) -> str:
         name = parts[1]
         category = parts[2]
         reject_and_correct_merchant(name, category)
-        return f"✅ Corrected *{name}* → {category}\nAll past transactions updated\."
+        return f"✅ Corrected *{name}* → {category}\nAll past transactions updated."
 
     if cmd == "/errors":
-        return "No recent errors logged\. ✅"
+        return "No recent errors logged. ✅"
 
-    return "Unknown admin command\."
+    return "Unknown admin command."
 
 def monitor_health():
     """Send health check — call this from a scheduled endpoint."""

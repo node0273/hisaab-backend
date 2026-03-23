@@ -19,7 +19,7 @@ BACKEND_URL = os.environ.get("BACKEND_URL", "")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "hisaab_secret_2024")
 
 async def send_telegram(chat_id: int, text: str, reply_markup=None):
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "MarkdownV2"}
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
     if reply_markup:
         payload["reply_markup"] = {"inline_keyboard": reply_markup}
     async with httpx.AsyncClient() as client:
