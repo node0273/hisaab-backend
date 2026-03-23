@@ -10,6 +10,58 @@ import requests
 from db import get_conn
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+
+# Business VPA keyword mapping
+VPA_KEYWORDS = {
+    'zomato': ('Zomato', 'Food & Dining', 'spend'),
+    'swiggy': ('Swiggy', 'Food & Dining', 'spend'),
+    'blinkit': ('Blinkit', 'Groceries', 'spend'),
+    'bigbasket': ('BigBasket', 'Groceries', 'spend'),
+    'zepto': ('Zepto', 'Groceries', 'spend'),
+    'amazon': ('Amazon', 'Shopping', 'spend'),
+    'flipkart': ('Flipkart', 'Shopping', 'spend'),
+    'myntra': ('Myntra', 'Shopping', 'spend'),
+    'uber': ('Uber', 'Travel & Transport', 'spend'),
+    'olacabs': ('Ola', 'Travel & Transport', 'spend'),
+    'rapido': ('Rapido', 'Travel & Transport', 'spend'),
+    'irctc': ('IRCTC', 'Travel & Transport', 'spend'),
+    'netflix': ('Netflix', 'Entertainment & OTT', 'spend'),
+    'hotstar': ('Hotstar', 'Entertainment & OTT', 'spend'),
+    'spotify': ('Spotify', 'Entertainment & OTT', 'spend'),
+    'airtel': ('Airtel', 'Utilities & Bills', 'spend'),
+    'jio': ('Jio', 'Utilities & Bills', 'spend'),
+    'apollopharmacy': ('Apollo Pharmacy', 'Health & Medical', 'spend'),
+    'pharmeasy': ('PharmEasy', 'Health & Medical', 'spend'),
+    'zerodha': ('Zerodha', 'Investments & Finance', 'investment'),
+    'groww': ('Groww', 'Investments & Finance', 'investment'),
+    'bse': ('BSE/MF', 'Investments & Finance', 'investment'),
+    'nse': ('NSE/MF', 'Investments & Finance', 'investment'),
+    'mfcentral': ('Mutual Fund', 'Investments & Finance', 'investment'),
+    'licpay': ('LIC', 'Insurance', 'spend'),
+    'dominos': ('Dominos', 'Food & Dining', 'spend'),
+    'kfc': ('KFC', 'Food & Dining', 'spend'),
+    'pizzahut': ('Pizza Hut', 'Food & Dining', 'spend'),
+    'starbucks': ('Starbucks', 'Food & Dining', 'spend'),
+    'makemytrip': ('MakeMyTrip', 'Travel & Transport', 'spend'),
+    'indigo': ('IndiGo', 'Travel & Transport', 'spend'),
+    'foodsquare': ('Food Square', 'Food & Dining', 'spend'),
+    'pranaam': ('Pranaam', 'Travel & Transport', 'spend'),
+    'paytm': ('Paytm', 'Other', 'spend'),
+}
+
+def check_vpa_keywords(vpa: str):
+    """Check VPA handle against known business keywords."""
+    if not vpa:
+        return None
+    handle = vpa.split('@')[0].lower()
+    # Remove numbers and special chars for matching
+    handle_clean = handle.replace('.', '').replace('-', '').replace('_', '')
+    for keyword, result in VPA_KEYWORDS.items():
+        if keyword in handle_clean or keyword in handle:
+            return result
+    return None
+
+
 ADMIN_TELEGRAM_ID = os.environ.get("ADMIN_TELEGRAM_ID", "8130140084")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 
@@ -70,7 +122,13 @@ def resolve_merchant(raw_name: str, vpa: str = "", amount: float = 0) -> tuple:
         else:
             return f"P2P - {person_name}", "P2P Transfer", "spend", person_name, False
 
-    # 2. Check VPA against known merchant patterns
+    # 2a. Check VPA keywords (fast, no DB needed)
+    if vpa:
+        result = check_vpa_keywords(vpa)
+        if result:
+            return result[0], result[1], result[2], "", False
+
+    # 2b. Check VPA against known merchant patterns in DB
     if vpa:
         result = check_vpa_in_db(vpa)
         if result:
@@ -78,6 +136,11 @@ def resolve_merchant(raw_name: str, vpa: str = "", amount: float = 0) -> tuple:
 
     # 3. Check name against DB (aliases + canonical)
     if raw_name:
+        # Check keywords in raw name too
+        raw_lower = raw_name.lower().replace(' ', '').replace('/', '')
+        for keyword, result in VPA_KEYWORDS.items():
+            if keyword in raw_lower:
+                return result[0], result[1], result[2], "", False
         result = check_name_in_db(raw_name)
         if result:
             return result[0], result[1], result[2], "", False
