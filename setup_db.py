@@ -294,3 +294,47 @@ print("   Tables: users, gmail_accounts, categories, merchants, transactions")
 print("   Tables: gmail_sync_log, conversations, rate_limits, audit_log")
 print(f"   Categories: {len(categories)} seeded")
 print(f"   Merchants: {len(merchants)} seeded")
+
+# ── Rules tables (added in v3) ────────────────────────────────
+cur.execute("""
+CREATE TABLE IF NOT EXISTS bank_senders (
+    id SERIAL PRIMARY KEY,
+    sender_email VARCHAR(255) UNIQUE NOT NULL,
+    bank_name VARCHAR(100) NOT NULL,
+    is_active BOOLEAN DEFAULT TRUE,
+    source VARCHAR(20) DEFAULT 'manual',
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS vpa_rules (
+    id SERIAL PRIMARY KEY,
+    keyword VARCHAR(255) UNIQUE NOT NULL,
+    merchant_canonical VARCHAR(255) NOT NULL,
+    category VARCHAR(100) NOT NULL,
+    treatment VARCHAR(20) DEFAULT 'spend',
+    is_active BOOLEAN DEFAULT TRUE,
+    source VARCHAR(20) DEFAULT 'manual',
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS nach_rules (
+    id SERIAL PRIMARY KEY,
+    keyword VARCHAR(255) UNIQUE NOT NULL,
+    merchant_canonical VARCHAR(255) NOT NULL,
+    category VARCHAR(100) NOT NULL,
+    treatment VARCHAR(20) DEFAULT 'spend',
+    is_active BOOLEAN DEFAULT TRUE,
+    source VARCHAR(20) DEFAULT 'manual',
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS learned_senders (
+    id SERIAL PRIMARY KEY,
+    sender_email VARCHAR(255) UNIQUE NOT NULL,
+    bank_name VARCHAR(100) NOT NULL,
+    is_active BOOLEAN DEFAULT TRUE,
+    discovered_at TIMESTAMPTZ DEFAULT NOW()
+);
+""")
+conn.commit()
+print("   Rules tables: bank_senders, vpa_rules, nach_rules, learned_senders")

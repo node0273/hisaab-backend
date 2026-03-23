@@ -9,7 +9,8 @@ Architecture:
 """
 import base64, re, os, requests, json
 from datetime import datetime, timedelta
-from bank_config import BANK_SENDERS, BANK_KEYWORDS, MODE_KEYWORDS, VPA_MERCHANT_MAP, NACH_MERCHANT_MAP
+from rules_engine import get_bank_from_sender, get_bank_from_keywords, get_merchant_from_vpa, get_merchant_from_nach, ensure_rules_tables, seed_rules_from_config
+from bank_config import MODE_KEYWORDS
 from db import get_last_sync, update_sync_log, save_transactions, update_access_token, get_conn
 from merchant_resolver import resolve_merchant
 
@@ -85,23 +86,11 @@ def parse_email_date(msg):
 # ── Bank identification ───────────────────────────────────────
 
 def identify_bank(sender_email: str, subject: str, body: str) -> str:
-    """Identify bank from sender email, then subject/body keywords."""
-    # 1. Exact sender match
-    if sender_email in BANK_SENDERS:
-        return BANK_SENDERS[sender_email]
-
-    # 2. Partial sender match
-    for known_sender, bank in BANK_SENDERS.items():
-        if known_sender in sender_email:
-            return bank
-
-    # 3. Subject/body keyword match
-    text = (subject + " " + body[:500]).lower()
-    for bank, keywords in BANK_KEYWORDS.items():
-        if any(kw in text for kw in keywords):
-            return bank
-
-    return None
+    """Identify bank using rules engine (DB + fallback to bank_config)."""
+    bank = get_bank_from_sender(sender_email)
+    if bank:
+        return bank
+    return get_bank_from_keywords(subject, body)
 
 # ── Rule-based transaction extraction ─────────────────────────
 
@@ -159,60 +148,23 @@ def extract_vpa(text: str) -> str:
     return ""
 
 def resolve_vpa_merchant(vpa: str) -> tuple:
-    """
-    Resolve VPA to merchant name and category.
-    Returns (canonical, category, treatment, person_name) or None
-    """
-    if not vpa:
-        return None
-    
-    handle = vpa.split("@")[0].lower()
-    handle_clean = re.sub(r'[^a-z0-9]', '', handle)
-    
-    # Check VPA_MERCHANT_MAP
-    for keyword, result in VPA_MERCHANT_MAP.items():
-        if keyword in handle_clean or keyword in handle:
-            if result is None:
-                # Payment app — need further resolution
-                return None
-            return result[0], result[1], result[2], ""
-    
-    # Person VPA detection
-    is_person = bool(
-        re.match(r'^\d{10}$', handle) or  # Phone number
-        re.match(r'^[a-z]+[.\-][a-z]+\d{0,4}$', handle)  # firstname.lastname
-    )
-    
-    if is_person:
-        # Extract person name
-        name = re.sub(r'[._\-]', ' ', handle)
-        name = re.sub(r'\d+$', '', name).strip().title()
-        if re.match(r'^\d{10}$', handle):
-            name = f"****{handle[-4:]}"
-        return None, None, None, name  # Signal: person VPA
-    
-    return None
+    """Resolve VPA using rules engine."""
+    return get_merchant_from_vpa(vpa)
 
 def extract_nach_merchant(body: str) -> tuple:
-    """Extract merchant from NACH/mandate email."""
-    body_lower = body.lower()
-    
-    for keyword, result in NACH_MERCHANT_MAP.items():
-        if keyword in body_lower:
-            return result[0], result[1], result[2]
-    
-    # Try to extract company name
+    """Extract NACH merchant using rules engine."""
+    result = get_merchant_from_nach(body)
+    if result:
+        return result
+    # Fallback: try to extract company name
     patterns = [
         r'towards\s+([A-Z][A-Za-z\s]+?)\s+(?:with|for|on|dated)',
         r'mandate.*?for\s+([A-Z][A-Za-z\s]+?)\s*(?:\n|with|for)',
-        r'company[:\s]+([A-Z][A-Za-z\s]+?)[\n,]',
     ]
     for pattern in patterns:
         m = re.search(pattern, body, re.IGNORECASE)
         if m:
-            name = m.group(1).strip()
-            return name, "Other", "spend"
-    
+            return m.group(1).strip(), "Other", "spend"
     return "NACH Payment", "Other", "spend"
 
 def rule_based_extract(subject: str, body: str, bank: str) -> dict:
@@ -348,9 +300,13 @@ Return ONLY valid JSON or null:
         resp.raise_for_status()
         text = resp.json()["content"][0]["text"].strip()
         text = re.sub(r'```json|```', '', text).strip()
-        if text.lower() == 'null':
+        if 'null' in text.lower() and '{' not in text:
             return None
-        data = json.loads(text)
+        # Extract just the JSON object
+        m = re.search(r'\{[^}]+\}', text, re.DOTALL)
+        if not m:
+            return None
+        data = json.loads(m.group(0))
         if not data.get("is_debit") or not data.get("amount"):
             return None
         return data
@@ -405,6 +361,8 @@ def sync_gmail_account(user_id: str, gmail_email: str, access_token: str, refres
     """Sync one Gmail account. Returns (new_transactions, banks_found)."""
     
     ensure_learned_senders_table()
+    ensure_rules_tables()
+    seed_rules_from_config()
     last_sync = get_last_sync(user_id, gmail_email)
     
     if last_sync:
