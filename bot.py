@@ -150,8 +150,26 @@ async def handle_callback(user_id: str, callback_data: str) -> tuple:
     return "Unknown option.", None
 
 async def do_sync(user_id: str, gmail_accounts: list) -> str:
+    """Run sync in background thread so Telegram doesn't timeout."""
+    import asyncio
+    import concurrent.futures
+
+    def run_sync():
+        try:
+            return sync_all(user_id, gmail_accounts)
+        except Exception as e:
+            import traceback
+            print(f"SYNC ERROR: {traceback.format_exc()}")
+            return {"new_transactions": 0, "banks_found": [], "error": str(e)}
+
     try:
-        result = sync_all(user_id, gmail_accounts)
+        loop = asyncio.get_event_loop()
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            result = await loop.run_in_executor(pool, run_sync)
+
+        if result.get("error"):
+            return f"Sync failed: {result['error'][:150]}"
+
         banks = ", ".join(result["banks_found"]) if result["banks_found"] else "none detected"
         new = result["new_transactions"]
         if result["banks_found"]:
@@ -167,7 +185,9 @@ async def do_sync(user_id: str, gmail_accounts: list) -> str:
                     "• Try *add gmail* to connect the Gmail that has bank alerts\n"
                     "• Which bank do you use?")
     except Exception as e:
-        return f"Sync failed. Please try again. ({str(e)[:80]})"
+        import traceback
+        print(f"DO_SYNC ERROR: {traceback.format_exc()}")
+        return f"Sync failed: {str(e)[:150]}"
 
 async def show_my_data(user_id: str, gmail_accounts: list) -> str:
     stats = get_sync_stats(user_id)
