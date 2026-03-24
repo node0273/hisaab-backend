@@ -180,18 +180,21 @@ def clean_merchant(name: str) -> str:
 # ── Amount extraction ─────────────────────────────────────────
 
 def extract_amount(text: str) -> float:
+    """Extract amount — handles Rs., INR, ₹ formats including HSBC snippet format"""
     patterns = [
-        r'(?:Rs\.?|INR|₹)\s*([\d,]+\.?\d*)',
-        r'for\s+INR\s+([\d,]+\.?\d*)',
+        r'for\s+INR\s+([\d,]+\.?\d*)',       # HSBC: "for INR 4294.00"
+        r'(?:Rs\.?|INR|₹)\s*([\d,]+\.?\d*)',  # Standard formats
         r'([\d,]+\.?\d*)\s*(?:rupees|rs\.?)',
         r'amount[:\s]+(?:Rs\.?|INR|₹)?\s*([\d,]+\.?\d*)',
+        r'debited.*?(?:Rs\.?|INR|₹)\s*([\d,]+\.?\d*)',
     ]
     for pattern in patterns:
         m = re.search(pattern, text, re.IGNORECASE)
         if m:
             try:
                 val = float(m.group(1).replace(",", ""))
-                if val > 0: return val
+                if 0 < val < 10000000:  # Sanity check: between 0 and 1 crore
+                    return val
             except: pass
     return None
 
@@ -205,16 +208,24 @@ def detect_mode(text: str) -> str:
     return "Unknown"
 
 def is_debit(subject: str, body: str) -> bool:
-    text = (subject + " " + body[:500]).lower()
-    skips = ["otp", "one time password", "login alert", "password reset",
-             "statement", "welcome", "account opening", "kyc",
-             "reward points", "cashback earned", "offer expires",
-             "minimum due", "payment due", "bill generated"]
-    if any(k in text for k in skips): return False
+    # Use subject + first 300 chars only to avoid HTML false positives
+    # Body may be raw HTML which contains CSS keywords
+    text = (subject + " " + body[:300]).lower()
+    
+    # Hard skips based on subject line only (more reliable)
+    subject_lower = subject.lower()
+    subject_skips = ["otp", "one time password", "login alert", "password reset",
+                     "statement ready", "account opening", "welcome to",
+                     "reward points", "cashback earned", "payment due",
+                     "minimum amount due", "bill generated", "account summary"]
+    if any(k in subject_lower for k in subject_skips): 
+        return False
+    
     credits = ["credited", "received", "refund", "cashback", "salary"]
     debits = ["debited", "debit", "spent", "used for", "has been used",
               "payment of", "paid to", "purchase", "transaction of",
-              "has been debited", "card has been used", "withdrawn"]
+              "has been debited", "card has been used", "withdrawn",
+              "transaction alert", "you have used"]
     c = sum(1 for k in credits if k in text)
     d = sum(1 for k in debits if k in text)
     return d > 0 and d >= c
