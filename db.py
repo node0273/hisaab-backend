@@ -222,13 +222,17 @@ def get_merchant_rules() -> dict:
             return {r[0]: (r[1], r[2], r[3]) for r in cur.fetchall()}
 
 def get_parsing_rules(bank: str, mode: str) -> list:
-    with get_conn() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("""
-                SELECT * FROM parsing_rules
-                WHERE bank = %s AND mode = %s AND status = 'approved'
-            """, (bank, mode))
-            return [dict(r) for r in cur.fetchall()]
+    try:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT * FROM parsing_rules
+                    WHERE bank = %s AND mode = %s AND status = 'approved'
+                """, (bank, mode))
+                return [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        # Table schema mismatch — return empty (AI will handle extraction)
+        return []
 
 def save_bank_sender(sender: str, bank: str, source: str = 'ai'):
     with get_conn() as conn:
