@@ -79,21 +79,56 @@ def decode_body(data):
     return base64.urlsafe_b64decode(data + "==").decode("utf-8", errors="ignore")
 
 def get_body(msg):
+    """
+    Extract readable text from email.
+    Priority: plain text part > HTML stripped > snippet
+    Snippet is always appended as it contains key transaction info.
+    """
+    import re as _re
     payload = msg.get("payload", {})
-    def walk(parts):
+    snippet = msg.get("snippet", "")
+
+    def walk_plain(parts):
         for p in parts:
             if p.get("mimeType") == "text/plain" and p.get("body", {}).get("data"):
                 return decode_body(p["body"]["data"])
             if "parts" in p:
-                r = walk(p["parts"])
+                r = walk_plain(p["parts"])
                 if r: return r
         return ""
+
+    def walk_html(parts):
+        for p in parts:
+            if p.get("mimeType") == "text/html" and p.get("body", {}).get("data"):
+                return decode_body(p["body"]["data"])
+            if "parts" in p:
+                r = walk_html(p["parts"])
+                if r: return r
+        return ""
+
     body = ""
+
+    # Try plain text first
     if payload.get("body", {}).get("data"):
-        body = decode_body(payload["body"]["data"])
+        raw = decode_body(payload["body"]["data"])
+        # Check if it's HTML
+        if "<html" in raw.lower() or "<body" in raw.lower():
+            body = _re.sub(r'<[^>]+>', ' ', raw)
+            body = _re.sub(r'\s+', ' ', body).strip()
+        else:
+            body = raw
     elif payload.get("parts"):
-        body = walk(payload["parts"])
-    return (body + " " + msg.get("snippet", ""))[:3000]
+        plain = walk_plain(payload["parts"])
+        if plain:
+            body = plain
+        else:
+            html = walk_html(payload["parts"])
+            if html:
+                body = _re.sub(r'<[^>]+>', ' ', html)
+                body = _re.sub(r'\s+', ' ', body).strip()
+
+    # Always put snippet first — it has the most reliable transaction info
+    return (snippet + " " + body)[:3000]
 
 def extract_sender(from_header: str) -> str:
     m = re.search(r'<([^>]+)>', from_header)
